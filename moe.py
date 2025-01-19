@@ -122,7 +122,6 @@ class MoE(nn.Module):
             ]
         )
 
-        self.rms_norm = RMSNorm(config.d_model)
         self.epsilon = config.epsilon
         self.expert_load_balance_factor = config.expert_load_balance_factor
 
@@ -130,7 +129,6 @@ class MoE(nn.Module):
         """
         x: tensor of shape [B, T, d_model]
         """
-        x = self.rms_norm(x)
         return (
             self._forward_optimized(x) if use_optimization else self._forward_forloop(x)
         )
