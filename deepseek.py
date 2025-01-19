@@ -26,6 +26,10 @@ class DeepSeek(nn.Module):
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.dropout = nn.Dropout(config.dropout)
         self.block_size = config.block_size
+        self.init_weight_std = config.init_weight_std
+        # initialize weights
+        self.apply(self._init_weights)
+        
         
     def forward(self, x: torch.tensor, targets: torch.tensor=None) -> torch.tensor:
         '''
@@ -39,20 +43,23 @@ class DeepSeek(nn.Module):
         
         x = self.lut(x)
         x = self.dropout(x)
-        block_loss = 0.
-        for block in self.blocks:
-            x, b_loss = block(x)
-            block_loss += b_loss if b_loss is not None else 0.
         
         if targets is not None:
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            loss += block_loss
         else:
             # for inference, only the last token logits is used for prediction the next token
             logits = self.lm_head(x[:, [-1], :])
             loss = None
         return logits, loss
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            module.weight.data.normal_(mean=0.0, std=self.init_weight_std)
+            if module.bias is not None:
+                module.bias.data.zero_()
+        elif isinstance(module, nn.Embedding):
+            module.weight.data.normal_(mean=0.0, std=self.init_weight_std)
 
 
 if __name__ == "__main__":
@@ -76,6 +83,7 @@ if __name__ == "__main__":
         expert_load_balance_factor=0.01,
         vocab_size=10000,
         num_layers=2,
+        init_weight_std=0.02,
     )
     input = torch.randint(0, config.vocab_size, (2, 2)).to(config.device)
     targets = torch.randint(0, config.vocab_size, (2, 2)).to(config.device)
@@ -86,5 +94,5 @@ if __name__ == "__main__":
     model.eval()
     output, loss = model(input, targets)
     print(f"when targets is None: output shape: {output.shape}, loss: {loss}")
-    for name, module in model.named_modules():
-            print(f"{name}: {module}")
+    # for name, module in model.named_modules():
+    #         print(f"{name}: {module}")
