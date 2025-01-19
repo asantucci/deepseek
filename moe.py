@@ -78,6 +78,28 @@ class FeedForward(nn.Module):
         return x
 
 
+class AddAuxiliaryLoss(torch.autograd.Function):
+    """
+    Copied from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py#L500
+    """
+
+    @staticmethod
+    def forward(ctx, x, loss):
+        assert loss.numel() == 1
+        ctx.dtype = loss.dtype
+        ctx.required_aux_loss = loss.requires_grad
+        return x
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        grad_loss = None
+        if ctx.required_aux_loss:
+            # when we requuired aux loss, this grad loss is for the gradient of the second input of forward
+            # which is the auxiliary loss
+            # effectively since the grad is 1, the aux loss is added to the loss
+            grad_loss = torch.ones(1, dtype=ctx.dtype, device=grad_output.device)
+        return grad_output, grad_loss
+
 class MoE(nn.Module):
     def __init__(self, config: DeepSeekConfig):
         super().__init__()
@@ -208,14 +230,9 @@ class MoE(nn.Module):
         ]
         # [B*T, d_model]
         routed_combined_outputs = distributor.combine(routed_expert_outputs)
-        shared_expert_outputs = torch.stack(
-            [self.shared_experts[i](x) for i in range(self.num_shared_experts)]
-        ).sum(dim=0)
-        output = routed_combined_outputs + shared_expert_outputs
-
-        # get the expert load balance loss. The definition can be found in https://arxiv.org/abs/2401.06066
-        expert_load_balance_loss = None
+        routed_combined_outputs = routed_combined_outputs.view(B, T, -1)
         if self.training:
+            # get the expert load balance loss. The definition can be found in https://arxiv.org/abs/2401.06066
             masked_gates = masked_gates.view(B, T, -1)
             gates = gates.view(B, T, -1)
             load = (masked_gates > 0).sum(dim=1)
@@ -228,7 +245,14 @@ class MoE(nn.Module):
                 ).sum(dim=1)
             )
             expert_load_balance_loss = expert_load_balance_loss.mean()
-        return output.view(B, T, -1), expert_load_balance_loss
+            routed_combined_outputs = AddAuxiliaryLoss.apply(
+                routed_combined_outputs, expert_load_balance_loss
+            )
+        shared_expert_outputs = torch.stack(
+            [self.shared_experts[i](x) for i in range(self.num_shared_experts)]
+        ).sum(dim=0).view(B, T, -1)
+        output = routed_combined_outputs + shared_expert_outputs
+        return output
 
 
 if __name__ == "__main__":
@@ -250,12 +274,11 @@ if __name__ == "__main__":
         num_activated_experts=4,
         epsilon=1e-9,
         expert_load_balance_factor=0.01,
-        num_blocks=1,
+        num_layers=1,
         vocab_size=10000,
     )
     input = torch.randn(2, 2, 1024).to(config.device)
     moe = MoE(config)
     moe = moe.to(config.device)
-    output, expert_load_balance_loss = moe(input)
+    output = moe(input)
     print(f"MoE output shape: {output.shape}")
-    print(f"Expert load balance loss: {expert_load_balance_loss}")
