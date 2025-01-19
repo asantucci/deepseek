@@ -7,27 +7,12 @@ from config import DeepSeekConfig
 
 
 class Distributor(object):
-    def __init__(
-        self,
-        gates: torch.tensor,
-        top_k: int,
-        epsilon: float = 1e-9,
-        use_weight_for_input: bool = True,
-    ):
+    def __init__(self, gates: torch.tensor, top_k: int):
         super().__init__()
-        # gates is [B, num_experts]
-        # [B, top_k]
+        # gates is [B*T, num_experts]
         self.top_k = top_k
-        print(f"gates: {gates}")
-        top_values, top_indices = torch.topk(gates, k=top_k, dim=-1, sorted=False)
-        # [B, num_experts]
-        masked_gates = torch.zeros_like(gates, dtype=gates.dtype).to(gates.device)
-        masked_gates = torch.scatter(masked_gates, 1, top_indices, top_values)
-        print(f"masked_gates: {masked_gates}")
-        # renormalize the masked gates
-        masked_gates = masked_gates / (masked_gates.sum(dim=-1, keepdim=True) + epsilon)
-        # [B*top_k, 2]
-        batch_and_experts_indices = torch.nonzero(masked_gates)
+        # [B*T*top_k, 2]
+        batch_and_experts_indices = torch.nonzero(gates)
         # sort the batch and experts indices along the first dimension, batch_and_experts_indices is a list
         # of tuples, where the first element is the batch index and the second element is the expert index
         # by sorting along the first dimension, we will let the same assigned expert index be adjacent
@@ -41,21 +26,19 @@ class Distributor(object):
             dim=0, stable=True
         )
         # get the order indices before sorting
-        # [B*top_k] one dimension tensor
+        # [B*T*top_k] one dimension tensor
         old_expert_indices = index_sorted_experts[:, 1]
         # find the batch index from the order of sorted experts
         # it will be used for the input tensors to make sure the tokens that assigned to the same expert are adjacent
         # and then use the _groups to split the input tensors
-        # [B*top_k] one dimension tensor
+        # [B*T*top_k] one dimension tensor
         self._batch_indices = batch_and_experts_indices[:, 0][old_expert_indices]
         # get the number of tokens assigned for each expert
         # [num_experts] one dimension tensor
-        self._groups = (masked_gates > 0).sum(dim=0).tolist()
-        # get the weights for each expert output. It just get the non zero elements from the masked gates for each column from left to right
-        # [B*top_k, 1]
-        self._weights = (
-            masked_gates.t().reshape(-1)[masked_gates.t().reshape(-1) > 0].view(-1, 1)
-        )
+        self._groups = (gates > 0).sum(dim=0).tolist()
+        # get the weights for each expert output. It just get the non zero elements from the gates for each column from left to right
+        # [B*T*top_k, 1]
+        self._weights = gates.t().reshape(-1)[gates.t().reshape(-1) > 0].view(-1, 1)
 
     def prepare_inputs_for_experts(self, x: torch.tensor) -> list[torch.tensor]:
         expanded_x = x[self._batch_indices]
@@ -140,7 +123,8 @@ class MoE(nn.Module):
         )
 
         self.rms_norm = RMSNorm(config.d_model)
-
+        self.epsilon = config.epsilon
+        self.expert_load_balance_factor = config.expert_load_balance_factor
     def forward(self, x: torch.tensor, use_optimization: bool = True) -> torch.tensor:
         """
         x: tensor of shape [B, T, d_model]
@@ -193,8 +177,8 @@ class MoE(nn.Module):
         1. first batch input tensors for each expert
         2. loop through each expert and transform its input tensors with matrix multiplication
         3. for each token, since it might be routed to multiple experts, we need to sum up its resutls with index_add function
-        
-        The reference for this implementation is 
+
+        The reference for this implementation is
         https://github.com/davidmrau/mixture-of-experts/blob/master/moe.py
 
         Args:
@@ -209,7 +193,15 @@ class MoE(nn.Module):
         x = x.view(B * T, -1)
         gates = x @ self.experts_weights
         gates = F.softmax(gates, dim=-1)
-        distributor = Distributor(gates, self.top_k)
+        top_values, top_indices = torch.topk(gates, k=self.top_k, dim=-1, sorted=False)
+        # [B * T, num_experts]
+        masked_gates = torch.zeros_like(gates, dtype=gates.dtype).to(gates.device)
+        masked_gates = torch.scatter(masked_gates, 1, top_indices, top_values)
+        # renormalize the masked gates
+        masked_gates = masked_gates / (
+            masked_gates.sum(dim=-1, keepdim=True) + self.epsilon
+        )
+        distributor = Distributor(masked_gates, self.top_k)
         routed_expert_inputs = distributor.prepare_inputs_for_experts(x)
         routed_expert_outputs = [
             self.routed_experts[i](routed_expert_inputs[i])
@@ -221,7 +213,17 @@ class MoE(nn.Module):
             [self.shared_experts[i](x) for i in range(self.num_shared_experts)]
         ).sum(dim=0)
         output = routed_combined_outputs + shared_expert_outputs + x
-        return output.view(B, T, -1)
+        
+        # get the expert load balance loss. The definition can be found in https://arxiv.org/abs/2401.06066
+        expert_load_balance_loss = None
+        if self.training:
+            load = (masked_gates > 0).sum(dim=0)
+            expert_prob_sum = gates.sum(dim=0)
+            expert_load_balance_loss = self.expert_load_balance_factor * (
+                (self.total_routed_experts  / (self.top_k * T) * load) * (1.0 / T *expert_prob_sum)
+            ).sum()
+        
+        return output.view(B, T, -1), expert_load_balance_loss
 
 
 if __name__ == "__main__":
@@ -241,9 +243,12 @@ if __name__ == "__main__":
         hidden_dimension=20,
         num_smaller_experts_per_expert=2,
         num_activated_experts=4,
+        epsilon=1e-9,
+        expert_load_balance_factor=0.01,
     )
     input = torch.randn(2, 2, 1024).to(config.device)
     moe = MoE(config)
     moe = moe.to(config.device)
-    output = moe(input)
+    output, expert_load_balance_loss = moe(input)
     print(f"MoE output shape: {output.shape}")
+    print(f"Expert load balance loss: {expert_load_balance_loss}")
