@@ -205,6 +205,10 @@ if __name__ == "__main__":
         hidden_dimension=20,
         num_smaller_experts_per_expert=2,
         num_activated_experts=4,
+        epsilon=1e-9,
+        expert_load_balance_factor=0.01,
+        num_layers=1,
+        vocab_size=10000,
     )
     mla = MultiHeadLatentAttention(config)
     mla = mla.to(config.device)
