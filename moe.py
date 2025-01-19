@@ -216,16 +216,18 @@ class MoE(nn.Module):
         # get the expert load balance loss. The definition can be found in https://arxiv.org/abs/2401.06066
         expert_load_balance_loss = None
         if self.training:
-            load = (masked_gates > 0).sum(dim=0)
-            expert_prob_sum = gates.sum(dim=0)
+            masked_gates = masked_gates.view(B, T, -1)
+            gates = gates.view(B, T, -1)
+            load = (masked_gates > 0).sum(dim=1)
+            expert_prob_sum = gates.sum(dim=1)
             expert_load_balance_loss = (
                 self.expert_load_balance_factor
                 * (
                     (self.total_routed_experts / (self.top_k * T) * load)
                     * (1.0 / T * expert_prob_sum)
-                ).sum()
+                ).sum(dim=1)
             )
-
+            expert_load_balance_loss = expert_load_balance_loss.mean()
         return output.view(B, T, -1), expert_load_balance_loss
 
 
@@ -248,6 +250,8 @@ if __name__ == "__main__":
         num_activated_experts=4,
         epsilon=1e-9,
         expert_load_balance_factor=0.01,
+        num_blocks=1,
+        vocab_size=10000,
     )
     input = torch.randn(2, 2, 1024).to(config.device)
     moe = MoE(config)
