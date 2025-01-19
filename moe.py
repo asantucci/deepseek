@@ -211,7 +211,7 @@ class MoE(nn.Module):
         shared_expert_outputs = torch.stack(
             [self.shared_experts[i](x) for i in range(self.num_shared_experts)]
         ).sum(dim=0)
-        output = routed_combined_outputs + shared_expert_outputs + x
+        output = routed_combined_outputs + shared_expert_outputs
 
         # get the expert load balance loss. The definition can be found in https://arxiv.org/abs/2401.06066
         expert_load_balance_loss = None
