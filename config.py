@@ -34,3 +34,8 @@ class DeepSeekConfig:
     num_activated_experts: int  # K
     epsilon: float
     expert_load_balance_factor: float # alpha1
+    
+    # DeepSeek model
+    num_layers: int
+    vocab_size: int
+    init_weight_std: float
