@@ -125,6 +125,7 @@ class MoE(nn.Module):
         self.rms_norm = RMSNorm(config.d_model)
         self.epsilon = config.epsilon
         self.expert_load_balance_factor = config.expert_load_balance_factor
+
     def forward(self, x: torch.tensor, use_optimization: bool = True) -> torch.tensor:
         """
         x: tensor of shape [B, T, d_model]
@@ -213,16 +214,20 @@ class MoE(nn.Module):
             [self.shared_experts[i](x) for i in range(self.num_shared_experts)]
         ).sum(dim=0)
         output = routed_combined_outputs + shared_expert_outputs + x
-        
+
         # get the expert load balance loss. The definition can be found in https://arxiv.org/abs/2401.06066
         expert_load_balance_loss = None
         if self.training:
             load = (masked_gates > 0).sum(dim=0)
             expert_prob_sum = gates.sum(dim=0)
-            expert_load_balance_loss = self.expert_load_balance_factor * (
-                (self.total_routed_experts  / (self.top_k * T) * load) * (1.0 / T *expert_prob_sum)
-            ).sum()
-        
+            expert_load_balance_loss = (
+                self.expert_load_balance_factor
+                * (
+                    (self.total_routed_experts / (self.top_k * T) * load)
+                    * (1.0 / T * expert_prob_sum)
+                ).sum()
+            )
+
         return output.view(B, T, -1), expert_load_balance_loss
 
 
