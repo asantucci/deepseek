@@ -7,11 +7,11 @@ from config import DeepSeekConfig
 
 
 class Distributor(object):
-    def __init__(self, gates: torch.tensor, top_k: int):
+    def __init__(self, gates: torch.tensor, topk: int):
         super().__init__()
         # gates is [B*T, num_experts]
-        self.top_k = top_k
-        # [B*T*top_k, 2]
+        self.topk = topk
+        # [B*T*topk, 2]
         batch_and_experts_indices = torch.nonzero(gates)
         # sort the batch and experts indices along the first dimension, batch_and_experts_indices is a list
         # of tuples, where the first element is the batch index and the second element is the expert index
@@ -21,23 +21,23 @@ class Distributor(object):
         # the second group is for second expert, etc.
         # use stable sort to guarantee the relative order of the same element so that we could get the weight for the expert output
         # with colume-wise order from left to right
-        # [B*top_k, 2]
+        # [B*topk, 2]
         sorted_experts, index_sorted_experts = batch_and_experts_indices.sort(
             dim=0, stable=True
         )
         # get the order indices before sorting
-        # [B*T*top_k] one dimension tensor
+        # [B*T*topk] one dimension tensor
         old_expert_indices = index_sorted_experts[:, 1]
         # find the batch index from the order of sorted experts
         # it will be used for the input tensors to make sure the tokens that assigned to the same expert are adjacent
         # and then use the _groups to split the input tensors
-        # [B*T*top_k] one dimension tensor
+        # [B*T*topk] one dimension tensor
         self._batch_indices = batch_and_experts_indices[:, 0][old_expert_indices]
         # get the number of tokens assigned for each expert
         # [num_experts] one dimension tensor
         self._groups = (gates > 0).sum(dim=0).tolist()
         # get the weights for each expert output. It just get the non zero elements from the gates for each column from left to right
-        # [B*T*top_k, 1]
+        # [B*T*topk, 1]
         self._weights = gates.t().reshape(-1)[gates.t().reshape(-1) > 0].view(-1, 1)
 
     def prepare_inputs_for_experts(self, x: torch.tensor) -> list[torch.tensor]:
@@ -45,15 +45,15 @@ class Distributor(object):
         return expanded_x.split(self._groups)
 
     def combine(self, expert_outputs: list[torch.tensor]) -> torch.tensor:
-        # [B*top_k, d_model]
+        # [B*topk, d_model]
         combined_output = torch.cat(expert_outputs, dim=0)
         # apply the weights to the expert outputs
-        # [B*top_k, d_model]
+        # [B*topk, d_model]
         combined_output = combined_output * self._weights
         # use index_add to add results for each token and the index is _batch_indices
         # [B, d_model]
         output = torch.zeros(
-            combined_output.shape[0] // self.top_k,
+            combined_output.shape[0] // self.topk,
             combined_output.shape[1],
             dtype=combined_output.dtype,
         ).to(combined_output.device)
@@ -62,19 +62,15 @@ class Distributor(object):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, d_model: int, hidden_dimension: int, dropout: float):
+    def __init__(self, d_model: int, hidden_dimension: int):
         super().__init__()
-        self.linear1 = nn.Linear(d_model, hidden_dimension, bias=False)
-        self.linear2 = nn.Linear(hidden_dimension, d_model, bias=False)
-        self.dropout = nn.Dropout(dropout)
+        self.gate_proj = nn.Linear(d_model, hidden_dimension, bias=False)
+        self.up_proj = nn.Linear(d_model, hidden_dimension, bias=False)
+        self.down_proj = nn.Linear(hidden_dimension, d_model, bias=False)
         self.activation = nn.SiLU()
-        self.rms_norm = RMSNorm(d_model)
 
     def forward(self, x: torch.Tensor):
-        x = self.linear1(self.rms_norm(x))
-        x = self.activation(x)
-        x = self.dropout(x)
-        x = self.linear2(x)
+        x = self.down_proj(self.activation(self.gate_proj(x)) * self.up_proj(x))
         return x
 
 
@@ -100,51 +96,42 @@ class AddAuxiliaryLoss(torch.autograd.Function):
             grad_loss = torch.ones(1, dtype=ctx.dtype, device=grad_output.device)
         return grad_output, grad_loss
 
+
 class MoE(nn.Module):
     def __init__(self, config: DeepSeekConfig):
         super().__init__()
 
         self.num_shared_experts = config.num_shared_experts
-        hidden_dimension_per_expert = (
-            config.hidden_dimension // config.num_smaller_experts_per_expert
-        )
+        self.moe_hidden_dimension = config.moe_hidden_dimension
 
-        self.top_k = (
-            config.num_activated_experts * config.num_smaller_experts_per_expert
-            - config.num_shared_experts
-        )
-        self.total_routed_experts = (
-            config.total_num_experts * config.num_smaller_experts_per_expert
-            - self.num_shared_experts
-        )
+        self.topk = config.topk
+        self.num_routed_experts = config.num_routed_experts
 
         # the weights intialization for deepseek is 0.006
         # from https://arxiv.org/abs/2401.06066
         # the number of potential routed experts is total_num_experts * num_smaller_experts_per_expert - num_shared_experts
         self.experts_weights = nn.Parameter(
             torch.randn(
+                self.num_routed_experts,
                 config.d_model,
-                self.total_routed_experts,
-                requires_grad=True,
             )
             * 0.006
         )
 
-        self.routed_experts = nn.ModuleList(
+        # routed experts
+        self.experts = nn.ModuleList(
             [
-                FeedForward(config.d_model, hidden_dimension_per_expert, config.dropout)
-                for _ in range(self.total_routed_experts)
+                FeedForward(config.d_model, self.moe_hidden_dimension)
+                for _ in range(self.num_routed_experts)
             ]
         )
 
-        self.shared_experts = nn.ModuleList(
-            [
-                FeedForward(config.d_model, hidden_dimension_per_expert, config.dropout)
-                for _ in range(self.num_shared_experts)
-            ]
+        self.shared_experts = FeedForward(
+            config.d_model, self.moe_hidden_dimension * self.num_shared_experts
         )
 
-        self.epsilon = config.epsilon
+        self.topk_norm_epsilon = config.topk_norm_epsilon
+        self.normalized_moe_gates = config.normalized_moe_gates
         self.expert_load_balance_factor = config.expert_load_balance_factor
 
     def forward(self, x: torch.tensor, use_optimization: bool = True) -> torch.tensor:
@@ -164,27 +151,23 @@ class MoE(nn.Module):
         x = x.view(B * T, -1)
         # first get the output for the routed MoE and then added up the results from shared MoE
         # [B * T, total_routed_experts]
-        routed_experts_output = x @ self.experts_weights
+        routed_experts_output = F.linear(x, self.experts_weights)
         scores = F.softmax(routed_experts_output, dim=-1)
         # apply gate along the expert dimension to get the top k experts for each token
-        # top_values: B * T, top_k, this is the score for each expert
-        # top_indices: B * T, top_k, this is the index to find the corresponding expert
-        top_values, top_indices = torch.topk(scores, k=self.top_k, dim=-1, sorted=False)
+        # top_values: B * T, topk, this is the score for each expert
+        # top_indices: B * T, topk, this is the index to find the corresponding expert
+        top_values, top_indices = torch.topk(scores, k=self.topk, dim=-1, sorted=False)
         routed_experts_output = torch.zeros_like(x, dtype=x.dtype).to(x.device)
         for i in range(x.shape[0]):
-            for j in range(self.top_k):
+            for j in range(self.topk):
                 routed_experts_output[i] += (
-                    self.routed_experts[top_indices[i, j]](x[i]) * top_values[i, j]
+                    self.experts[top_indices[i, j]](x[i]) * top_values[i, j]
                 )
 
-        shared_experts_output = torch.zeros_like(x, dtype=x.dtype).to(x.device)
-        # add the shared experts output
-        for i in range(x.shape[0]):
-            for j in range(self.num_shared_experts):
-                shared_experts_output[i] += self.shared_experts[j](x[i])
+        shared_experts_output = self.shared_experts(x)
 
         # the output is sum of shared expert output and routed expert output plus the residual connection
-        output = routed_experts_output + shared_experts_output + x
+        output = routed_experts_output + shared_experts_output
         output = output.view(B, T, -1)  # [B, T, d_model]
 
         return output
@@ -212,21 +195,22 @@ class MoE(nn.Module):
         B, T = x.shape[0], x.shape[1]
         # [B* T, d_model]
         x = x.view(B * T, -1)
-        gates = x @ self.experts_weights
+        gates = F.linear(x, self.experts_weights)
         gates = F.softmax(gates, dim=-1)
-        top_values, top_indices = torch.topk(gates, k=self.top_k, dim=-1, sorted=False)
+        top_values, top_indices = torch.topk(gates, k=self.topk, dim=-1, sorted=False)
         # [B * T, num_experts]
         masked_gates = torch.zeros_like(gates, dtype=gates.dtype).to(gates.device)
         masked_gates = torch.scatter(masked_gates, 1, top_indices, top_values)
-        # renormalize the masked gates
-        masked_gates = masked_gates / (
-            masked_gates.sum(dim=-1, keepdim=True) + self.epsilon
-        )
-        distributor = Distributor(masked_gates, self.top_k)
+        if self.normalized_moe_gates:
+            # renormalize the masked gates
+            masked_gates = masked_gates / (
+                masked_gates.sum(dim=-1, keepdim=True) + self.topk_norm_epsilon
+            )
+        distributor = Distributor(masked_gates, self.topk)
         routed_expert_inputs = distributor.prepare_inputs_for_experts(x)
         routed_expert_outputs = [
-            self.routed_experts[i](routed_expert_inputs[i])
-            for i in range(self.total_routed_experts)
+            self.experts[i](routed_expert_inputs[i])
+            for i in range(self.num_routed_experts)
         ]
         # [B*T, d_model]
         routed_combined_outputs = distributor.combine(routed_expert_outputs)
@@ -237,20 +221,15 @@ class MoE(nn.Module):
             gates = gates.view(B, T, -1)
             load = (masked_gates > 0).sum(dim=1)
             expert_prob_sum = gates.sum(dim=1)
-            expert_load_balance_loss = (
-                self.expert_load_balance_factor
-                * (
-                    (self.total_routed_experts / (self.top_k * T) * load)
-                    * (1.0 / T * expert_prob_sum)
-                ).sum(dim=1)
-            )
+            expert_load_balance_loss = self.expert_load_balance_factor * (
+                (self.num_routed_experts / (self.topk * T) * load)
+                * (1.0 / T * expert_prob_sum)
+            ).sum(dim=1)
             expert_load_balance_loss = expert_load_balance_loss.mean()
             routed_combined_outputs = AddAuxiliaryLoss.apply(
                 routed_combined_outputs, expert_load_balance_loss
             )
-        shared_expert_outputs = torch.stack(
-            [self.shared_experts[i](x) for i in range(self.num_shared_experts)]
-        ).sum(dim=0).view(B, T, -1)
+        shared_expert_outputs = self.shared_experts(x).view(B, T, -1)
         output = routed_combined_outputs + shared_expert_outputs
         return output
 
@@ -267,18 +246,26 @@ if __name__ == "__main__":
         kv_lora_rank=512,
         rope_head_dim=64,
         nope_head_dim=128,
-        num_shared_experts=3,
-        total_num_experts=5,
-        hidden_dimension=20,
-        num_smaller_experts_per_expert=2,
-        num_activated_experts=4,
-        epsilon=1e-9,
+        num_shared_experts=1,
+        num_routed_experts=1,
+        moe_hidden_dimension=20,
+        mlp_hidden_dimension=20,
+        topk=1,
+        topk_norm_epsilon=1e-9,
+        rms_norm_eps=1e-6,
+        normalized_moe_gates=True,
         expert_load_balance_factor=0.01,
         num_layers=1,
         vocab_size=10000,
+        init_weight_std=0.006,
+        first_k_dense_replace=0,
     )
     input = torch.randn(2, 2, 1024).to(config.device)
-    moe = MoE(config)
-    moe = moe.to(config.device)
-    output = moe(input)
+    model = MoE(config)
+    model = model.to(config.device)
+    output = model(input)
     print(f"MoE output shape: {output.shape}")
+    sd = model.state_dict()
+    sd_keys = sd.keys()
+    for key in sd_keys:
+        print(f"{key}: {sd[key].shape}")

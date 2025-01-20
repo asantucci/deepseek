@@ -27,14 +27,16 @@ class DeepSeekConfig:
     nope_head_dim: int
 
     # MoE parameters
-    num_shared_experts: int  # Ns
-    total_num_experts: int  # N
-    hidden_dimension: int
-    num_smaller_experts_per_expert: int  # m
-    num_activated_experts: int  # K
-    epsilon: float
+    num_shared_experts: int
+    num_routed_experts: int
+    topk: int
+    moe_hidden_dimension: int
+    mlp_hidden_dimension: int
+    topk_norm_epsilon: float
+    normalized_moe_gates: bool
     expert_load_balance_factor: float # alpha1
-    
+    rms_norm_eps: float
+    first_k_dense_replace: int
     # DeepSeek model
     num_layers: int
     vocab_size: int
