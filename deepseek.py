@@ -98,6 +98,7 @@ if __name__ == "__main__":
         kv_lora_rank=512,
         rope_head_dim=64,
         nope_head_dim=128,
+        v_head_dim=128,
         num_shared_experts=1,
         num_routed_experts=1,
         moe_hidden_dimension=20,
@@ -110,7 +111,7 @@ if __name__ == "__main__":
         num_layers=1,
         vocab_size=10000,
         init_weight_std=0.006,
-        first_k_dense_replace=1,
+        first_k_dense_replace=0,
     )
     input = torch.randint(0, config.vocab_size, (2, 2)).to(config.device)
     targets = torch.randint(0, config.vocab_size, (2, 2)).to(config.device)

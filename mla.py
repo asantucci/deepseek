@@ -11,33 +11,41 @@ class MultiHeadLatentAttention(nn.Module):
         super().__init__()
 
         # transformation for Q
-        self.q_down_proj = nn.Linear(config.d_model, config.q_lora_rank, bias=False)
-        self.q_rms_norm = RMSNorm(config.q_lora_rank)
-        self.q_up_proj = nn.Linear(
-            config.q_lora_rank,
-            config.nheads * (config.rope_head_dim + config.nope_head_dim),
-            bias=False,
-        )
+        self.q_head_dim = config.rope_head_dim + config.nope_head_dim
+        self.q_lora_rank = config.q_lora_rank
+        if config.q_lora_rank is not None:
+            self.q_a_proj = nn.Linear(config.d_model, config.q_lora_rank, bias=False)
+            self.q_a_layernorm = RMSNorm(config.q_lora_rank)
+            self.q_b_proj = nn.Linear(
+                config.q_lora_rank,
+                config.nheads * self.q_head_dim,
+                bias=False,
+            )
+        else:
+            self.q_proj = nn.Linear(
+                config.d_model, config.nheads * self.q_head_dim, bias=False
+            )
 
         # tranformation for K and V
-        self.kv_down_proj = nn.Linear(config.d_model, config.kv_lora_rank, bias=False)
-        self.kv_rms_norm = RMSNorm(config.kv_lora_rank)
-        self.k_up_proj = nn.Linear(
-            config.kv_lora_rank, config.nheads * config.nope_head_dim, bias=False
+        self.kv_a_proj_with_mqa = nn.Linear(
+            config.d_model, config.kv_lora_rank + config.rope_head_dim, bias=False
         )
-        self.k_rope_proj = nn.Linear(config.d_model, config.rope_head_dim, bias=False)
-        self.v_up_proj = nn.Linear(
-            config.kv_lora_rank, config.nheads * config.nope_head_dim, bias=False
+        self.kv_a_layernorm = RMSNorm(config.kv_lora_rank)
+        self.kv_b_proj = nn.Linear(
+            config.kv_lora_rank,
+            config.nheads * (config.nope_head_dim + config.v_head_dim),
+            bias=False,
         )
-        self.out = nn.Linear(
-            config.nheads * config.nope_head_dim, config.d_model, bias=False
+        self.o_proj = nn.Linear(
+            config.nheads * config.v_head_dim, config.d_model, bias=False
         )
         self.dropout = nn.Dropout(config.dropout)
 
         self.nheads = config.nheads
         self.rope_head_dim = config.rope_head_dim
         self.nope_head_dim = config.nope_head_dim
-
+        self.kv_lora_rank = config.kv_lora_rank
+        self.v_head_dim = config.v_head_dim
         self.use_kv_cache = config.use_kv_cache
         self.cache_kv_lora = None
         self.cache_k_rope = None
@@ -124,19 +132,18 @@ class MultiHeadLatentAttention(nn.Module):
             positions = torch.arange(x.shape[1]).to(x.device)
         B, T = x.shape[0], x.shape[1]
         # transform Q
-        q_lora = self.q_down_proj(x)  # B, T, q_lora_rank
-        q_lora_norm = self.q_rms_norm(q_lora)
-        q_up_proj = self.q_up_proj(
-            q_lora_norm
-        )  # B, T, nheads * (rope_head_dim + nope_head_dim)
-        q_up_proj = q_up_proj.view(
-            B, T, self.nheads, -1
-        )  # B, T, nheads, rope_head_dim + nope_head_dim
-        q_up_proj.transpose_(1, 2)  # B, nheads, T, rope_head_dim + nope_head_dim
+        if self.q_lora_rank is not None:
+            q = self.q_a_proj(x)  # B, T, q_lora_rank
+            q = self.q_a_layernorm(q)
+            q = self.q_b_proj(q)
+        else:
+            q = self.q_proj(x)
+        q = q.view(B, -1, self.nheads, self.q_head_dim)
+        q.transpose_(1, 2)  # B, nheads, T, rope_head_dim + nope_head_dim
         # q_nope: B, nheads, T, nope_head_dim
         # q_rope: B, nheads, T, rope_head_dim
         q_nope, q_rope = torch.split(
-            q_up_proj, [self.nope_head_dim, self.rope_head_dim], dim=-1
+            q, [self.nope_head_dim, self.rope_head_dim], dim=-1
         )
         q_rope = self.apply_rope(
             q_rope, positions, self.rope_embeddings
@@ -146,45 +153,44 @@ class MultiHeadLatentAttention(nn.Module):
         )  # B, T, nheads, rope_head_dim + nope_head_dim
 
         # transform K and V
-        kv_lora = self.kv_rms_norm(self.kv_down_proj(x))  # B, T, kv_lora_rank
-        k_shared_rope = self.k_rope_proj(x)  # B, T, rope_head_dim
+        # B, T, kv_lora_rank + rope_head_dim
+        kv_compressed = self.kv_a_proj_with_mqa(x)
+        # kv_compressed: B, T, kv_lora_rank
+        # k_shared_rope: B, T, rope_head_dim
+        kv_compressed, k_shared_rope = kv_compressed.split(
+            [self.kv_lora_rank, self.rope_head_dim], dim=-1
+        )
         k_shared_rope = self.apply_rope(
             k_shared_rope, positions, self.rope_embeddings
         )  # B, T, rope_head_dim
         if self.cache_kv_lora is None:
-            self.cache_kv_lora = kv_lora
+            self.cache_kv_lora = kv_compressed
             self.cache_k_rope = k_shared_rope
         else:
-            self.cache_kv_lora = torch.cat((self.cache_kv_lora, kv_lora), dim=1)
+            self.cache_kv_lora = torch.cat((self.cache_kv_lora, kv_compressed), dim=1)
             self.cache_k_rope = torch.cat((self.cache_k_rope, k_shared_rope), dim=1)
-        k_nope = self.k_up_proj(self.cache_kv_lora)  # B, T, nheads * nope_head_dim
-        k_nope = k_nope.view(
-            B, -1, self.nheads, self.nope_head_dim
-        )  # B, T, nheads, nope_head_dim
+        kv = self.kv_b_proj(self.kv_a_layernorm(self.cache_kv_lora)).view(
+            B, -1, self.nheads, self.nope_head_dim + self.v_head_dim
+        )  # B, T, nheads, (nope_head_dim + v_head_dim)
+        k_nope, v = torch.split(kv, [self.nope_head_dim, self.v_head_dim], dim=-1)
         k_shared_rope = self.cache_k_rope.view(B, -1, 1, self.rope_head_dim).expand(
             -1, -1, self.nheads, -1
         )  # B, T, nheads, rope_head_dim
-        print(f"k_shared_rope shape: {k_shared_rope.shape}")
-        print(f"k_nope shape: {k_nope.shape}")
         k = torch.cat(
             (k_nope, k_shared_rope), dim=-1
         )  # B, T, nheads, rope_head_dim + nope_head_dim
 
-        v = self.v_up_proj(self.cache_kv_lora)  # B, T, nheads * nope_head_dim
-        v = v.view(
-            B, -1, self.nheads, self.nope_head_dim
-        )  # B, T, nheads, nope_head_dim
-
-        k.transpose_(1, 2)  # B, nheads, T, rope_head_dim + nope_head_dim
-        v.transpose_(1, 2)  # B, nheads, T, nope_head_dim
-
+        k = k.transpose(1, 2)  # B, nheads, T, rope_head_dim + nope_head_dim
+        v = v.transpose(1, 2)  # B, nheads, T, v_head_dim
+        
+        # flash attention v1
         output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         output = (
             output.transpose(1, 2)
             .contiguous()
-            .view(B, -1, self.nheads * self.nope_head_dim)
+            .view(B, -1, self.nheads * self.v_head_dim)
         )
-        output = self.out(output)
+        output = self.o_proj(output)
         return self.dropout(output)
 
 
@@ -200,6 +206,7 @@ if __name__ == "__main__":
         kv_lora_rank=512,
         rope_head_dim=64,
         nope_head_dim=128,
+        v_head_dim=128,
         num_shared_experts=1,
         num_routed_experts=1,
         moe_hidden_dimension=20,
@@ -219,13 +226,8 @@ if __name__ == "__main__":
     input = torch.randn(2, 2, 1024).to(config.device)
     output = mla(input)
     print(f"MLA output shape: {output.shape}")
-    # print("Add another token")
-    # new_token_ermbedding = torch.randn(2, 1, 1024).to(config.device)
-    # input = torch.cat((input, new_token_ermbedding), dim=1)
-    # output = mla(input)
-    # print(f"MLA output shape: {output.shape}")
-
-    moe = MoE(config)
-    moe = moe.to(config.device)
-    output = moe(output)
-    print(f"MoE output shape: {output.shape}")
+    print("Add another token")
+    new_token_ermbedding = torch.randn(2, 1, 1024).to(config.device)
+    input = torch.cat((input, new_token_ermbedding), dim=1)
+    output = mla(input)
+    print(f"MLA output shape: {output.shape}")

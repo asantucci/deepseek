@@ -20,11 +20,12 @@ class DeepSeekConfig:
     dropout: float
     device: str
     use_kv_cache: bool
-    # query low rank
+    # MLA parameters
     q_lora_rank: int
     kv_lora_rank: int
     rope_head_dim: int
     nope_head_dim: int
+    v_head_dim: int
 
     # MoE parameters
     num_shared_experts: int
