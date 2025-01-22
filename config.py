@@ -26,6 +26,7 @@ class DeepSeekConfig:
     rope_head_dim: int
     nope_head_dim: int
     v_head_dim: int
+    rope_base: int
 
     # MoE parameters
     num_shared_experts: int

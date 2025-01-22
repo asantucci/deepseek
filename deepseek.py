@@ -98,6 +98,7 @@ if __name__ == "__main__":
         kv_lora_rank=512,
         rope_head_dim=64,
         nope_head_dim=128,
+        rope_base=10000,
         v_head_dim=128,
         num_shared_experts=1,
         num_routed_experts=1,

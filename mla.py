@@ -6,6 +6,131 @@ import torch.nn.functional as F
 from config import DeepSeekConfig
 
 
+# https://arxiv.org/abs/2104.09864
+def apply_original_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply rope to the q and k
+
+    Args:
+        q: the query tensor of shape (batch_size, nheads, seq_len, rope_head_dim)
+        k: the key tensor of shape (batch_size, nheads, seq_len, rope_head_dim)
+        positions: the positions of the input tensor
+        cos: the cosine part of the rope embedding, shape (seq_len, rope_head_dim / 2)
+        sin: the sine part of the rope embedding, shape (seq_len, rope_head_dim / 2)
+    Returns:
+        q and k after applying rope
+    """
+    q_even = q[..., 0::2]
+    q_odd = q[..., 1::2]
+    k_even = k[..., 0::2]
+    k_odd = k[..., 1::2]
+    cos = cos[positions]
+    sin = sin[positions]
+    q_rotated = torch.zeros_like(q)
+    k_rotated = torch.zeros_like(k)
+    # in deepseek implementation, x_even * cos_embed - x_odd * sin_embed is first half
+    # x_odd * cos_embed + x_even * sin_embed is second half
+    # https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/modeling_deepseek.py#L339
+    q_rotated[..., 0::2] = q_even * cos - q_odd * sin
+    q_rotated[..., 1::2] = q_odd * cos + q_even * sin
+    k_rotated[..., 0::2] = k_even * cos - k_odd * sin
+    k_rotated[..., 1::2] = k_odd * cos + k_even * sin
+    return q_rotated, k_rotated
+
+
+def rotate_half(x):
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+# https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/modeling_deepseek.py#L339
+def apply_deepseek_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    positions: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Apply rope to the q and k.
+
+    The difference between the original rope and the deepseek rope is that the deepseek rope
+
+    Args:
+        q: the query tensor of shape (batch_size, nheads, seq_len, rope_head_dim)
+        k: the key tensor of shape (batch_size, nheads, seq_len, rope_head_dim)
+        positions: the positions of the input tensor
+        cos: the cosine part of the rope embedding, shape (seq_len, rope_head_dim)
+        sin: the sine part of the rope embedding, shape (seq_len, rope_head_dim)
+    Returns:
+        q and k after applying rope
+    """
+    cos = cos[positions]
+    sin = sin[positions]
+
+    b, h, s, d = q.shape
+    # transform q and k so that the even indices elements are the first half
+    # the odd indices elements are the second half
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    # the sequence length for q and k might be different due to kv cache
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+
+    q_rotated = (q * cos) + (rotate_half(q) * sin)
+    k_rotated = (k * cos) + (rotate_half(k) * sin)
+    return q_rotated, k_rotated
+
+
+"""
+Get the cos and sin for the rope embeddings
+"""
+
+
+class RotaryEmbedding(nn.Module):
+    def __init__(
+        self,
+        rope_head_dim: int,
+        max_content_length: int,
+        base: int = 10000,
+        device: str = "cuda",
+    ):
+        super().__init__()
+        self.rope_head_dim = rope_head_dim
+        self.max_content_length = max_content_length
+        self.base = base
+        self.device = device
+
+        freqs = 1.0 / (
+            base
+            ** (torch.arange(0, rope_head_dim, 2).float().to(device) / rope_head_dim)
+        )
+        self.register_buffer("freqs", freqs, persistent=False)
+        self.max_seq_len_cached = None
+        self._set_cos_sin_cache(
+            seq_len=max_content_length, device=self.freqs.device, dtype=self.freqs.dtype
+        )
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(seq_len, device=device, dtype=dtype)
+        freqs = torch.outer(t, self.freqs.to(t.device))
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos(), persistent=False)
+        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+
+    def forward(self, x, seq_len=None):
+        if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
+            self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
+        return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+
+
 class MultiHeadLatentAttention(nn.Module):
     def __init__(self, config: DeepSeekConfig):
         super().__init__()
@@ -44,11 +169,14 @@ class MultiHeadLatentAttention(nn.Module):
         self.nheads = config.nheads
         self.rope_head_dim = config.rope_head_dim
         self.nope_head_dim = config.nope_head_dim
+        self.block_size = config.block_size
+        self.rope_base = config.rope_base
         self.kv_lora_rank = config.kv_lora_rank
         self.v_head_dim = config.v_head_dim
         self.use_kv_cache = config.use_kv_cache
         self.cache_kv_lora = None
         self.cache_k_rope = None
+        self._init_rope()
         self.register_buffer(
             "rope_embeddings",
             self.rope_embedding(
@@ -57,6 +185,13 @@ class MultiHeadLatentAttention(nn.Module):
                 base=10000,
                 device=torch.device(config.device),
             ),
+        )
+
+    def _init_rope(self):
+        self.rope_embeddings_1 = RotaryEmbedding(
+            self.rope_head_dim,
+            self.block_size,
+            base=self.rope_base,
         )
 
     def rope_embedding(
@@ -84,7 +219,7 @@ class MultiHeadLatentAttention(nn.Module):
         positions = torch.arange(block_size).to(device)
         angles = positions.unsqueeze(-1) * freqs.unsqueeze(
             0
-        )  # (block_size, rope_head_dim/2)
+        )  # (block_size, rope_head_dim)
         embeddings = torch.zeros((block_size, rope_head_dim)).to(
             device
         )  # (block_size, rope_head_dim)
@@ -99,7 +234,7 @@ class MultiHeadLatentAttention(nn.Module):
         Apply rope to the input tensor
 
         Args:
-            x: the input tensor of shape (batch_size, seq_len, rope_head_dim) or (batch_size, seq_len, nheads, rope_head_dim)
+            x: the input tensor of shape (batch_size, seq_len, rope_head_dim) or (batch_size, nheads, seq_len, rope_head_dim)
             positions: the positions of the input tensor (seq_len)
             rope_embeddings: the rope embeddings of shape (max_seq_len, rope_head_dim)
         Returns:
@@ -113,6 +248,9 @@ class MultiHeadLatentAttention(nn.Module):
         cos_embed = rope_embeddings[positions, 0::2]
         sin_embed = rope_embeddings[positions, 1::2]
         x_rotated = torch.zeros_like(x)
+        # in deepseek implementation, x_even * cos_embed - x_odd * sin_embed is first half
+        # x_odd * cos_embed + x_even * sin_embed is second half
+        # https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/modeling_deepseek.py#L339
         x_rotated[..., 0::2] = x_even * cos_embed - x_odd * sin_embed
         x_rotated[..., 1::2] = x_odd * cos_embed + x_even * sin_embed
         return x_rotated
@@ -182,7 +320,7 @@ class MultiHeadLatentAttention(nn.Module):
 
         k = k.transpose(1, 2)  # B, nheads, T, rope_head_dim + nope_head_dim
         v = v.transpose(1, 2)  # B, nheads, T, v_head_dim
-        
+
         # flash attention v1
         output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
         output = (
@@ -206,6 +344,7 @@ if __name__ == "__main__":
         kv_lora_rank=512,
         rope_head_dim=64,
         nope_head_dim=128,
+        rope_base=10000,
         v_head_dim=128,
         num_shared_experts=1,
         num_routed_experts=1,
