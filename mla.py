@@ -4,6 +4,7 @@ from torch.nn import RMSNorm
 import numpy as np
 import torch.nn.functional as F
 from config import DeepSeekConfig
+from typing import Optional
 
 
 # https://arxiv.org/abs/2104.09864
@@ -131,10 +132,36 @@ class RotaryEmbedding(nn.Module):
         return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
 
 
-class MultiHeadLatentAttention(nn.Module):
-    def __init__(self, config: DeepSeekConfig):
-        super().__init__()
+class KVCache(object):
+    def __init__(self, num_layers: int):
+        self.key_cache = [None] * num_layers
+        self.value_cache = [None] * num_layers
 
+    def update(
+        self, key_states: torch.Tensor, value_states: torch.Tensor, layer_idx: int
+    ):
+        # key_states and value_states are of shape [bsz, num_heads, seq_len, head_dim]
+        past_keys = self.key_cache[layer_idx]
+        past_values = self.value_cache[layer_idx]
+        if past_keys is None:
+            self.key_cache[layer_idx] = key_states
+            self.value_cache[layer_idx] = value_states
+        else:
+            # concatenate along the sequence length dimension
+            self.key_cache[layer_idx] = torch.cat((past_keys, key_states), dim=-2)
+            self.value_cache[layer_idx] = torch.cat((past_values, value_states), dim=-2)
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
+
+    def get_cache_length(self, layer_idx: int):
+        if self.key_cache[layer_idx] is None:
+            return 0
+        return self.key_cache[layer_idx].shape[-2]
+
+
+class MultiHeadLatentAttention(nn.Module):
+    def __init__(self, config: DeepSeekConfig, layer_idx: int):
+        super().__init__()
+        self.layer_idx = layer_idx
         # transformation for Q
         self.q_head_dim = config.rope_head_dim + config.nope_head_dim
         self.q_lora_rank = config.q_lora_rank
@@ -172,164 +199,106 @@ class MultiHeadLatentAttention(nn.Module):
         self.block_size = config.block_size
         self.rope_base = config.rope_base
         self.kv_lora_rank = config.kv_lora_rank
+        self.q_lora_rank = config.q_lora_rank
         self.v_head_dim = config.v_head_dim
-        self.use_kv_cache = config.use_kv_cache
-        self.cache_kv_lora = None
-        self.cache_k_rope = None
         self._init_rope()
-        self.register_buffer(
-            "rope_embeddings",
-            self.rope_embedding(
-                config.block_size,
-                config.rope_head_dim,
-                base=10000,
-                device=torch.device(config.device),
-            ),
-        )
 
     def _init_rope(self):
-        self.rope_embeddings_1 = RotaryEmbedding(
+        self.rope = RotaryEmbedding(
             self.rope_head_dim,
             self.block_size,
             base=self.rope_base,
         )
 
-    def rope_embedding(
+    def forward(
         self,
-        block_size: int,
-        rope_head_dim: int,
-        base: int = 10000,
-        device: torch.device = torch.device("cpu"),
-    ) -> torch.Tensor:
-        """
-        Generate the rope embeddings where the number of rows is the block size
-        and the number of columns is the rope head dimension
+        x: torch.Tensor,
+        past_key_value: Optional[KVCache] = None,
+    ):
+        B, q_len = x.shape[:2]
 
-        Args:
-            block_size: max sequence length or context length
-            rope_head_dim: the rope head dimension
-            base: the base frequency
-        Returns:
-            rope_embeddings: the rope embeddings of shape (block_size, rope_head_dim)
-        """
-        dim_indices = torch.arange(0, rope_head_dim, 2).to(
-            device
-        )  # lenght of rope_head_dim / 2
-        freqs = 1 / (base ** (dim_indices / rope_head_dim))
-        positions = torch.arange(block_size).to(device)
-        angles = positions.unsqueeze(-1) * freqs.unsqueeze(
-            0
-        )  # (block_size, rope_head_dim)
-        embeddings = torch.zeros((block_size, rope_head_dim)).to(
-            device
-        )  # (block_size, rope_head_dim)
-        embeddings[:, 0::2] = torch.cos(angles)
-        embeddings[:, 1::2] = torch.sin(angles)
-        return embeddings
-
-    def apply_rope(
-        self, x: torch.Tensor, positions: torch.Tensor, rope_embeddings: torch.Tensor
-    ) -> torch.Tensor:
-        """
-        Apply rope to the input tensor
-
-        Args:
-            x: the input tensor of shape (batch_size, seq_len, rope_head_dim) or (batch_size, nheads, seq_len, rope_head_dim)
-            positions: the positions of the input tensor (seq_len)
-            rope_embeddings: the rope embeddings of shape (max_seq_len, rope_head_dim)
-        Returns:
-            the rotated tensor of shape (batch_size, seq_len, rope_head_dim)
-        """
-        assert (
-            x.shape[1] <= rope_embeddings.shape[0]
-        ), "The sequence length of x must be less than or equal to the sequence length of rope_embeddings"
-        x_even = x[..., 0::2]
-        x_odd = x[..., 1::2]
-        cos_embed = rope_embeddings[positions, 0::2]
-        sin_embed = rope_embeddings[positions, 1::2]
-        x_rotated = torch.zeros_like(x)
-        # in deepseek implementation, x_even * cos_embed - x_odd * sin_embed is first half
-        # x_odd * cos_embed + x_even * sin_embed is second half
-        # https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/modeling_deepseek.py#L339
-        x_rotated[..., 0::2] = x_even * cos_embed - x_odd * sin_embed
-        x_rotated[..., 1::2] = x_odd * cos_embed + x_even * sin_embed
-        return x_rotated
-
-    def forward(self, x):
-        if self.use_kv_cache:
-            return self.forward_with_kv_cache(x)
-        raise NotImplementedError("Non KV cache is not supported")
-
-    def forward_with_kv_cache(self, x):
-        # if the cache is not empty which means it is autoregressive token generation
-        # instead of context, we only need the last token to compute the q, k, v
-        if self.cache_k_rope is not None:
-            x = x[:, [-1], :]
-            positions = torch.tensor([x.shape[1] - 1]).to(x.device)
-        else:
-            positions = torch.arange(x.shape[1]).to(x.device)
-        B, T = x.shape[0], x.shape[1]
-        # transform Q
         if self.q_lora_rank is not None:
-            q = self.q_a_proj(x)  # B, T, q_lora_rank
-            q = self.q_a_layernorm(q)
+            q = self.q_a_layernorm(self.q_a_proj(x))
             q = self.q_b_proj(q)
         else:
             q = self.q_proj(x)
-        q = q.view(B, -1, self.nheads, self.q_head_dim)
-        q.transpose_(1, 2)  # B, nheads, T, rope_head_dim + nope_head_dim
-        # q_nope: B, nheads, T, nope_head_dim
-        # q_rope: B, nheads, T, rope_head_dim
+        # B, nheads, q_len, rope_head_dim + nope_head_dim
+        q = q.view(B, q_len, self.nheads, self.q_head_dim).transpose(1, 2)
+        # q_nope: B, nheads, q_len, nope_head_dim
+        # q_rope: B, nheads, q_len, rope_head_dim
         q_nope, q_rope = torch.split(
             q, [self.nope_head_dim, self.rope_head_dim], dim=-1
         )
-        q_rope = self.apply_rope(
-            q_rope, positions, self.rope_embeddings
-        )  # B, T, nheads, rope_head_dim
-        q = torch.cat(
-            (q_nope, q_rope), dim=-1
-        )  # B, T, nheads, rope_head_dim + nope_head_dim
 
-        # transform K and V
-        # B, T, kv_lora_rank + rope_head_dim
+        # B, q_len, kv_lora_rank + rope_head_dim
         kv_compressed = self.kv_a_proj_with_mqa(x)
-        # kv_compressed: B, T, kv_lora_rank
-        # k_shared_rope: B, T, rope_head_dim
-        kv_compressed, k_shared_rope = kv_compressed.split(
+        # kv_compressed: B, q_len, kv_lora_rank
+        # k_rope: B, q_len, rope_head_dim
+        kv_compressed, k_rope = kv_compressed.split(
             [self.kv_lora_rank, self.rope_head_dim], dim=-1
         )
-        k_shared_rope = self.apply_rope(
-            k_shared_rope, positions, self.rope_embeddings
-        )  # B, T, rope_head_dim
-        if self.cache_kv_lora is None:
-            self.cache_kv_lora = kv_compressed
-            self.cache_k_rope = k_shared_rope
-        else:
-            self.cache_kv_lora = torch.cat((self.cache_kv_lora, kv_compressed), dim=1)
-            self.cache_k_rope = torch.cat((self.cache_k_rope, k_shared_rope), dim=1)
-        kv = self.kv_b_proj(self.kv_a_layernorm(self.cache_kv_lora)).view(
-            B, -1, self.nheads, self.nope_head_dim + self.v_head_dim
-        )  # B, T, nheads, (nope_head_dim + v_head_dim)
-        k_nope, v = torch.split(kv, [self.nope_head_dim, self.v_head_dim], dim=-1)
-        k_shared_rope = self.cache_k_rope.view(B, -1, 1, self.rope_head_dim).expand(
-            -1, -1, self.nheads, -1
-        )  # B, T, nheads, rope_head_dim
-        k = torch.cat(
-            (k_nope, k_shared_rope), dim=-1
-        )  # B, T, nheads, rope_head_dim + nope_head_dim
+        # add head dimension to k_rope. This k_rope is shared across all heads
+        k_rope = k_rope.view(B, 1, q_len, self.rope_head_dim)
 
-        k = k.transpose(1, 2)  # B, nheads, T, rope_head_dim + nope_head_dim
-        v = v.transpose(1, 2)  # B, nheads, T, v_head_dim
+        # B, nheads, T, (nope_head_dim + v_head_dim)
+        kv = (
+            self.kv_b_proj(self.kv_a_layernorm(kv_compressed))
+            .view(B, -1, self.nheads, self.nope_head_dim + self.v_head_dim)
+            .transpose(1, 2)
+        )
+        k_nope, value_states = torch.split(
+            kv, [self.nope_head_dim, self.v_head_dim], dim=-1
+        )
 
-        # flash attention v1
-        output = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        # apply rope to k_rope and q_rope
+        # first get the seq_len including cache before this token
+        past_seq_len = 0
+        if past_key_value is not None:
+            past_seq_len = past_key_value.get_cache_length(self.layer_idx)
+
+        positions = torch.arange(
+            past_seq_len, q_len + past_seq_len, device=x.device, dtype=torch.long
+        )
+        kv_seq_len = q_len + past_seq_len
+        cos, sin = self.rope(value_states, seq_len=kv_seq_len)
+        # q_rope: B, nheads, q_len, rope_head_dim
+        # k_rope: B, 1, q_len, rope_head_dim
+        q_rope, k_rope = apply_deepseek_rope(q_rope, k_rope, positions, cos, sin)
+
+        # concatenate q/k_rope and q/k_nope
+        query_states = q_rope.new_empty(B, self.nheads, q_len, self.q_head_dim)
+        query_states[..., : self.nope_head_dim] = q_nope
+        query_states[..., self.nope_head_dim :] = q_rope
+
+        key_states = k_rope.new_empty(B, self.nheads, q_len, self.q_head_dim)
+        key_states[..., : self.nope_head_dim] = k_nope
+        key_states[..., self.nope_head_dim :] = k_rope
+
+        # update kv cache
+        if past_key_value is not None:
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx
+            )
+
+        # when the q_len = kv_seq_len, the attention mask is casual mask
+        # otherwise, the query can attend to all past tokens, so the attention bias is all 0
+        attn_mask = None
+        if q_len == kv_seq_len:
+            attn_mask = torch.tril(
+                torch.ones(q_len, q_len, device=x.device), diagonal=0
+            ).bool()
+        # B, nheads, q_len, v_head_dim
+        output = F.scaled_dot_product_attention(
+            query_states, key_states, value_states, attn_mask=attn_mask
+        )
+        # B, q_len, nheads * v_head_dim
         output = (
             output.transpose(1, 2)
             .contiguous()
             .view(B, -1, self.nheads * self.v_head_dim)
         )
         output = self.o_proj(output)
-        return self.dropout(output)
+        return output, past_key_value
 
 
 if __name__ == "__main__":
@@ -360,13 +329,24 @@ if __name__ == "__main__":
         init_weight_std=0.006,
         first_k_dense_replace=0,
     )
-    mla = MultiHeadLatentAttention(config)
+    mla = MultiHeadLatentAttention(config, layer_idx=0)
     mla = mla.to(config.device)
     input = torch.randn(2, 2, 1024).to(config.device)
-    output = mla(input)
+    output, _ = mla(input)
     print(f"MLA output shape: {output.shape}")
     print("Add another token")
     new_token_ermbedding = torch.randn(2, 1, 1024).to(config.device)
     input = torch.cat((input, new_token_ermbedding), dim=1)
-    output = mla(input)
+    output, _ = mla(input)
     print(f"MLA output shape: {output.shape}")
+    
+    # use kv cache
+    mla = MultiHeadLatentAttention(config, layer_idx=0).to(config.device)
+    kv_cache = KVCache(config.num_layers)
+    output, kv_cache = mla(input, kv_cache)
+    print(f"MLA output shape: {output.shape}")
+    print(f"KV cache shape: {kv_cache.key_cache[0].shape}")
+    new_token_ermbedding = torch.randn(2, 1, 1024).to(config.device)
+    output, kv_cache = mla(new_token_ermbedding, kv_cache)
+    print(f"MLA output shape: {output.shape}")
+    print(f"KV cache shape: {kv_cache.key_cache[0].shape}")

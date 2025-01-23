@@ -70,6 +70,10 @@ class FeedForward(nn.Module):
         self.activation = nn.SiLU()
 
     def forward(self, x: torch.Tensor):
+        # this is different from the FeedForward in Transformer paper
+        # not sure why DeepSeek use the gate_proj instead of activation(up_proj(x))
+        # to be able to load the checkpoint, follow their implementation at
+        # https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/blob/main/modeling_deepseek.py#L389
         x = self.down_proj(self.activation(self.gate_proj(x)) * self.up_proj(x))
         return x
 
