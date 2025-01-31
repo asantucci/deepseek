@@ -6,7 +6,7 @@ from config import DeepSeekConfig
 import torch.nn.functional as F
 from typing import Optional
 from mla import KVCache
-
+import json
 
 class Block(nn.Module):
     def __init__(self, config: DeepSeekConfig, block_idx: int):
@@ -48,7 +48,7 @@ class DeepSeekModel(nn.Module):
         )
         self.embed_tokens = nn.Embedding(config.vocab_size, config.d_model)
         self.dropout = nn.Dropout(config.dropout)
-        self.block_size = config.block_size
+        self.max_position_embeddings = config.max_position_embeddings
         self.init_weight_std = config.init_weight_std
         self.norm = nn.RMSNorm(config.d_model, eps=config.rms_norm_eps)
 
@@ -65,8 +65,8 @@ class DeepSeekModel(nn.Module):
         """
         B, T = x.shape
         assert (
-            T <= self.block_size
-        ), f"Sequence length {T} cannot exceed block size {self.block_size}"
+            T <= self.max_position_embeddings
+        ), f"Sequence length {T} cannot exceed block size {self.max_position_embeddings}"
 
         x = self.embed_tokens(x)
         x = self.dropout(x)
@@ -110,33 +110,9 @@ class DeepSeekModelForCausalLM(nn.Module):
 
 
 if __name__ == "__main__":
-    config = DeepSeekConfig(
-        d_model=1024,
-        nheads=128,
-        block_size=512,
-        dropout=0.0,
-        device="cuda",
-        use_kv_cache=True,
-        q_lora_rank=1536,
-        kv_lora_rank=512,
-        rope_head_dim=64,
-        nope_head_dim=128,
-        rope_base=10000,
-        v_head_dim=128,
-        num_shared_experts=1,
-        num_routed_experts=1,
-        moe_hidden_dimension=20,
-        mlp_hidden_dimension=20,
-        topk=1,
-        topk_norm_epsilon=1e-9,
-        rms_norm_eps=1e-6,
-        normalized_moe_gates=True,
-        expert_load_balance_factor=0.01,
-        num_layers=1,
-        vocab_size=10000,
-        init_weight_std=0.006,
-        first_k_dense_replace=0,
-    )
+    with open("config.json", "r") as f:
+        config = json.load(f)
+    config = DeepSeekConfig(**config)
     input = torch.randint(0, config.vocab_size, (2, 2)).to(config.device)
     targets = torch.randint(0, config.vocab_size, (2, 2)).to(config.device)
     model = DeepSeekModelForCausalLM(config).to(config.device)

@@ -16,7 +16,7 @@ nope_head_dim: 128, d_h
 class DeepSeekConfig:
     d_model: int
     nheads: int
-    block_size: int
+    max_position_embeddings: int
     dropout: float
     device: str
     use_kv_cache: bool
@@ -27,6 +27,7 @@ class DeepSeekConfig:
     nope_head_dim: int
     v_head_dim: int
     rope_base: int
+    rope_scaling: dict
 
     # MoE parameters
     num_shared_experts: int

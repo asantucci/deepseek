@@ -4,7 +4,7 @@ from torch.nn import RMSNorm
 import numpy as np
 import torch.nn.functional as F
 from config import DeepSeekConfig
-
+import json
 
 class Distributor(object):
     def __init__(self, gates: torch.tensor, topk: int):
@@ -239,31 +239,9 @@ class MoE(nn.Module):
 
 
 if __name__ == "__main__":
-    config = DeepSeekConfig(
-        d_model=1024,
-        nheads=128,
-        block_size=512,
-        dropout=0.0,
-        device="cuda",
-        use_kv_cache=True,
-        q_lora_rank=1536,
-        kv_lora_rank=512,
-        rope_head_dim=64,
-        nope_head_dim=128,
-        num_shared_experts=1,
-        num_routed_experts=1,
-        moe_hidden_dimension=20,
-        mlp_hidden_dimension=20,
-        topk=1,
-        topk_norm_epsilon=1e-9,
-        rms_norm_eps=1e-6,
-        normalized_moe_gates=True,
-        expert_load_balance_factor=0.01,
-        num_layers=1,
-        vocab_size=10000,
-        init_weight_std=0.006,
-        first_k_dense_replace=0,
-    )
+    with open("config.json", "r") as f:
+        config = json.load(f)
+    config = DeepSeekConfig(**config)
     input = torch.randn(2, 2, 1024).to(config.device)
     model = MoE(config)
     model = model.to(config.device)

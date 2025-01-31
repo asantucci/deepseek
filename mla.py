@@ -5,9 +5,12 @@ import numpy as np
 import torch.nn.functional as F
 from config import DeepSeekConfig
 from typing import Optional
-
+import math
+import json
 
 # https://arxiv.org/abs/2104.09864
+# look at https://github.com/kingoflolz/mesh-transformer-jax/blob/f2aa66e0925de6593dcbb70e72399b97b4130482/mesh_transformer/layers.py#L144
+# to see if we could use this implementation
 def apply_original_rope(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -98,38 +101,221 @@ class RotaryEmbedding(nn.Module):
     def __init__(
         self,
         rope_head_dim: int,
-        max_content_length: int,
+        max_position_embeddings: int,
         base: int = 10000,
         device: str = "cuda",
     ):
         super().__init__()
         self.rope_head_dim = rope_head_dim
-        self.max_content_length = max_content_length
+        self.max_position_embeddings = max_position_embeddings
         self.base = base
         self.device = device
 
-        freqs = 1.0 / (
+        inv_freqs = 1.0 / (
             base
             ** (torch.arange(0, rope_head_dim, 2).float().to(device) / rope_head_dim)
         )
-        self.register_buffer("freqs", freqs, persistent=False)
+        self.register_buffer("inv_freqs", inv_freqs, persistent=False)
         self.max_seq_len_cached = None
         self._set_cos_sin_cache(
-            seq_len=max_content_length, device=self.freqs.device, dtype=self.freqs.dtype
+            seq_len=max_position_embeddings,
+            device=self.inv_freqs.device,
+            dtype=self.inv_freqs.dtype,
         )
 
     def _set_cos_sin_cache(self, seq_len, device, dtype):
         self.max_seq_len_cached = seq_len
         t = torch.arange(seq_len, device=device, dtype=dtype)
-        freqs = torch.outer(t, self.freqs.to(t.device))
+        freqs = torch.outer(t, self.inv_freqs.to(t.device))
         emb = torch.cat((freqs, freqs), dim=-1)
-        self.register_buffer("cos_cached", emb.cos(), persistent=False)
-        self.register_buffer("sin_cached", emb.sin(), persistent=False)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
 
     def forward(self, x, seq_len=None):
         if self.max_seq_len_cached is None or seq_len > self.max_seq_len_cached:
             self._set_cos_sin_cache(seq_len=seq_len, device=x.device, dtype=x.dtype)
         return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
+
+
+# proposed by reddit user /u/kaiokendev
+# https://www.reddit.com/r/LocalLLaMA/comments/14fgjqj/a_simple_way_to_extending_context_to_8k/
+# concurrent work from meta: https://arxiv.org/abs/2306.15595
+class PositinalInterpolationRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        rope_head_dim: int,
+        max_position_embeddings: int,
+        base: int = 10000,
+        device: str = "cuda",
+        scaling_factor: float = 1.0,
+    ):
+        self.scaling_factor = scaling_factor
+        super().__init__(rope_head_dim, max_position_embeddings, base, device)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        t = torch.arange(seq_len, device=device, dtype=self.inv_freqs.dtype)
+        t = t / self.scaling_factor
+        freqs = torch.outer(t, self.inv_freqs)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+
+class NTKAwareRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        rope_head_dim: int,
+        max_position_embeddings: int,
+        base: int = 10000,
+        device: str = "cuda",
+        alpha: float = 1.0,
+    ):
+        base = base * alpha ** (rope_head_dim / (rope_head_dim - 2))
+        super().__init__(rope_head_dim, max_position_embeddings, base, device)
+
+
+class DynamicNTKAwareScalingRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        rope_head_dim: int,
+        max_position_embeddings: int,
+        base: int = 10000,
+        device: str = "cuda",
+        scaling_factor: float = 1.0,
+    ):
+        super().__init__(rope_head_dim, max_position_embeddings, base, device)
+        self.scaling_factor = scaling_factor
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        if seq_len > self.max_position_embeddings:
+            # (self.scaling_factor * seq_len / self.max_position_embeddings)- (self.scaling_factor - 1)
+            # is the same as
+            # scaling_factor * (seq_len - max_position_embeddings) / max_position_embeddings + 1
+            # which makes more sense and easier to understand
+            base = self.base * (
+                (self.scaling_factor * seq_len / self.max_position_embeddings)
+                - (self.scaling_factor - 1)
+            ) ** (self.rope_head_dim / (self.rope_head_dim - 2))
+            inv_freqs = 1.0 / (
+                base
+                ** (
+                    torch.arange(0, self.rope_head_dim, 2).float().to(device)
+                    / self.rope_head_dim
+                )
+            )
+            self.register_buffer("inv_freqs", inv_freqs, persistent=False)
+        t = torch.arange(seq_len, device=device, dtype=dtype)
+        freqs = torch.outer(t, self.inv_freqs)
+        emb = torch.cat((freqs, freqs), dim=-1)
+        self.register_buffer("cos_cached", emb.cos().to(dtype), persistent=False)
+        self.register_buffer("sin_cached", emb.sin().to(dtype), persistent=False)
+
+
+def find_yarn_dim(ratio, training_context_length, rope_head_dim, base):
+    # ratio = training_context_length / wave_length
+    # wave_length = 2 * math.pi * base ** (2 * d / rope_head_dim)
+    # this is to solve the above equations to find d
+    return (
+        rope_head_dim
+        * math.log(training_context_length / (2 * math.pi * ratio))
+        / (2 * math.log(base))
+    )
+
+
+def find_yarn_cut_dims(alpha, beta, training_context_length, rope_head_dim, base):
+    low = find_yarn_dim(beta, training_context_length, rope_head_dim, base)
+    low = math.floor(low)
+    high = find_yarn_dim(alpha, training_context_length, rope_head_dim, base)
+    high = math.ceil(high)
+    return max(low, 0), min(high, rope_head_dim - 1)
+
+
+def yarn_ramp_mask(min, max, dim):
+    if min == max:
+        max += 0.001
+    linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
+    ramp_func = torch.clamp(linear_func, 0, 1)
+    return ramp_func
+
+
+def get_yarn_mscale(scaling_factor, attn_factor):
+    if scaling_factor <= 1:
+        return 1.0
+    return (0.1 * math.log(scaling_factor) + 1.0) * attn_factor
+
+
+class YarnRotaryEmbedding(RotaryEmbedding):
+    def __init__(
+        self,
+        rope_head_dim: int,
+        max_position_embeddings: int,
+        base: int = 10000,
+        device: str = "cuda",
+        scaling_factor: float = 1.0,
+        training_context_length: int = 1024,
+        alpha: int = 1,
+        beta: int = 32,
+        attn_factor: float = 1.0,
+    ):
+        """
+        From the paper: https://arxiv.org/pdf/2309.00071
+        scaling_factor: the ratio between inference context length and training context length
+        alpha: eq(18) of YaRN paper
+        beta: eq(18) of YaRN paper
+        attn_factor: the scaling factor for the temperature
+        """
+        self.scaling_factor = scaling_factor
+        self.training_context_length = training_context_length
+        self.alpha = alpha
+        self.beta = beta
+        self.attn_factor = attn_factor
+        super().__init__(rope_head_dim, max_position_embeddings, base, device)
+
+    def _set_cos_sin_cache(self, seq_len, device, dtype):
+        self.max_seq_len_cached = seq_len
+        inv_freqs_interpolation = 1.0 / (
+            self.scaling_factor
+            * self.base ** torch.arange(0, self.rope_head_dim, 2).float().to(device)
+            / self.rope_head_dim
+        )
+        inv_freqs_extrapolation = 1.0 / (
+            self.base ** torch.arange(0, self.rope_head_dim, 2).float().to(device)
+            / self.rope_head_dim
+        )
+        low, high = find_yarn_cut_dims(
+            self.alpha,
+            self.beta,
+            self.training_context_length,
+            self.rope_head_dim,
+            self.base,
+        )
+        # for dimension lower than low, use extrapolation
+        # for dimension higher than high, use interpolation
+        # for dimension between low and high, use both extrapolation and interpolation
+        # for mask is 1, use extrapolation, for mask is 0, use interpolation
+        # in between use both
+        inv_freq_mask = 1.0 - yarn_ramp_mask(
+            low, high, self.rope_head_dim // 2
+        ).float().to(device)
+        inv_freqs = (
+            1.0 - inv_freq_mask
+        ) * inv_freqs_interpolation + inv_freq_mask * inv_freqs_extrapolation
+        self.register_buffer("inv_freqs", inv_freqs, persistent=False)
+
+        t = torch.arange(seq_len, device=device, dtype=dtype)
+        freqs = torch.outer(t, self.inv_freqs)
+        emb = torch.cat((freqs, freqs), dim=-1)
+
+        _mscale = get_yarn_mscale(self.scaling_factor, self.attn_factor)
+
+        self.register_buffer(
+            "cos_cached", (emb.cos() * _mscale).to(dtype), persistent=False
+        )
+        self.register_buffer(
+            "sin_cached", (emb.sin() * _mscale).to(dtype), persistent=False
+        )
 
 
 class KVCache(object):
@@ -161,6 +347,7 @@ class KVCache(object):
 class MultiHeadLatentAttention(nn.Module):
     def __init__(self, config: DeepSeekConfig, layer_idx: int):
         super().__init__()
+        self.config = config
         self.layer_idx = layer_idx
         # transformation for Q
         self.q_head_dim = config.rope_head_dim + config.nope_head_dim
@@ -196,7 +383,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.nheads = config.nheads
         self.rope_head_dim = config.rope_head_dim
         self.nope_head_dim = config.nope_head_dim
-        self.block_size = config.block_size
+        self.max_position_embeddings = config.max_position_embeddings
         self.rope_base = config.rope_base
         self.kv_lora_rank = config.kv_lora_rank
         self.q_lora_rank = config.q_lora_rank
@@ -204,11 +391,45 @@ class MultiHeadLatentAttention(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
-        self.rope = RotaryEmbedding(
-            self.rope_head_dim,
-            self.block_size,
-            base=self.rope_base,
-        )
+        if self.config.rope_scaling is None:
+            self.rope = RotaryEmbedding(
+                self.rope_head_dim,
+                self.max_position_embeddings,
+                base=self.rope_base,
+            )
+        else:
+            scaling_type = self.config.rope_scaling["type"]
+            scaling_factor = self.config.rope_scaling["scaling_factor"]
+            if scaling_type == "pi":
+                self.rope = PositinalInterpolationRotaryEmbedding(
+                    self.rope_head_dim,
+                    self.max_position_embeddings,
+                    base=self.rope_base,
+                    scaling_factor=scaling_factor,
+                )
+            elif scaling_type == "dynamic":
+                self.rope = DynamicNTKAwareScalingRotaryEmbedding(
+                    self.rope_head_dim,
+                    self.max_position_embeddings,
+                    base=self.rope_base,
+                    scaling_factor=scaling_factor,
+                )
+            elif scaling_type == "yarn":
+                alpha = self.config.rope_scaling["alpha"]
+                beta = self.config.rope_scaling["beta"]
+                attn_factor = self.config.rope_scaling["attn_factor"]
+                self.rope = YarnRotaryEmbedding(
+                    self.rope_head_dim,
+                    self.max_position_embeddings,
+                    base=self.rope_base,
+                    scaling_factor=scaling_factor,
+                    alpha=alpha,
+                    beta=beta,
+                    attn_factor=attn_factor,
+                    training_context_length=self.config.rope_scaling[
+                        "training_context_length"
+                    ],
+                )
 
     def forward(
         self,
@@ -302,33 +523,9 @@ class MultiHeadLatentAttention(nn.Module):
 
 
 if __name__ == "__main__":
-    config = DeepSeekConfig(
-        d_model=1024,
-        nheads=128,
-        block_size=512,
-        dropout=0.0,
-        device="cuda",
-        use_kv_cache=True,
-        q_lora_rank=1536,
-        kv_lora_rank=512,
-        rope_head_dim=64,
-        nope_head_dim=128,
-        rope_base=10000,
-        v_head_dim=128,
-        num_shared_experts=1,
-        num_routed_experts=1,
-        moe_hidden_dimension=20,
-        mlp_hidden_dimension=20,
-        topk=1,
-        topk_norm_epsilon=1e-9,
-        rms_norm_eps=1e-6,
-        normalized_moe_gates=True,
-        expert_load_balance_factor=0.01,
-        num_layers=1,
-        vocab_size=10000,
-        init_weight_std=0.006,
-        first_k_dense_replace=0,
-    )
+    with open("config.json", "r") as f:
+        config = json.load(f)
+    config = DeepSeekConfig(**config)
     mla = MultiHeadLatentAttention(config, layer_idx=0)
     mla = mla.to(config.device)
     input = torch.randn(2, 2, 1024).to(config.device)
@@ -339,7 +536,7 @@ if __name__ == "__main__":
     input = torch.cat((input, new_token_ermbedding), dim=1)
     output, _ = mla(input)
     print(f"MLA output shape: {output.shape}")
-    
+
     # use kv cache
     mla = MultiHeadLatentAttention(config, layer_idx=0).to(config.device)
     kv_cache = KVCache(config.num_layers)
