@@ -8,6 +8,7 @@ from typing import Optional
 import math
 import json
 
+
 # https://arxiv.org/abs/2104.09864
 # look at https://github.com/kingoflolz/mesh-transformer-jax/blob/f2aa66e0925de6593dcbb70e72399b97b4130482/mesh_transformer/layers.py#L144
 # to see if we could use this implementation
@@ -378,7 +379,8 @@ class MultiHeadLatentAttention(nn.Module):
         self.o_proj = nn.Linear(
             config.nheads * config.v_head_dim, config.d_model, bias=False
         )
-        self.dropout = nn.Dropout(config.dropout)
+        self.attention_dropout_rate = config.dropout
+        self.residual_dropout = nn.Dropout(config.dropout)
 
         self.nheads = config.nheads
         self.rope_head_dim = config.rope_head_dim
@@ -510,7 +512,11 @@ class MultiHeadLatentAttention(nn.Module):
             ).bool()
         # B, nheads, q_len, v_head_dim
         output = F.scaled_dot_product_attention(
-            query_states, key_states, value_states, attn_mask=attn_mask
+            query_states,
+            key_states,
+            value_states,
+            attn_mask=attn_mask,
+            dropout_p=self.attention_dropout_rate,
         )
         # B, q_len, nheads * v_head_dim
         output = (
@@ -518,7 +524,7 @@ class MultiHeadLatentAttention(nn.Module):
             .contiguous()
             .view(B, -1, self.nheads * self.v_head_dim)
         )
-        output = self.o_proj(output)
+        output = self.residual_dropout(self.o_proj(output))
         return output, past_key_value
 
 

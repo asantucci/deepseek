@@ -138,13 +138,11 @@ class MoE(nn.Module):
         self.normalized_moe_gates = config.normalized_moe_gates
         self.expert_load_balance_factor = config.expert_load_balance_factor
 
-    def forward(self, x: torch.tensor, use_optimization: bool = True) -> torch.tensor:
+    def forward(self, x: torch.tensor) -> torch.tensor:
         """
         x: tensor of shape [B, T, d_model]
         """
-        return (
-            self._forward_optimized(x) if use_optimization else self._forward_forloop(x)
-        )
+        return self._forward_optimized(x)
 
     def _forward_forloop(self, x: torch.tensor):
         """

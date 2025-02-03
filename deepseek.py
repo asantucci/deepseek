@@ -78,8 +78,10 @@ class DeepSeekModel(nn.Module):
 class DeepSeekModelForCausalLM(nn.Module):
     def __init__(self, config: DeepSeekConfig):
         super().__init__()
+        self.topk = config.topk
         self.lm_head = nn.Linear(config.d_model, config.vocab_size, bias=False)
         self.model = DeepSeekModel(config)
+        self.config = config
         # initialize weights
         self.init_weight_std = config.init_weight_std
         self.apply(self._init_weights)
@@ -91,6 +93,29 @@ class DeepSeekModelForCausalLM(nn.Module):
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=self.init_weight_std)
+            
+    def get_total_parameters(self):
+        total_params = 0
+        activated_params = 0
+        routed_moe_module_name = "mlp.experts"
+        activated_routed_moe_module_name = [
+            f"{routed_moe_module_name}.{i}" for i in range(self.topk)
+        ]
+
+        def is_activated_routed_moe_module(name: str):
+            for activated_routed_moe_module in activated_routed_moe_module_name:
+                if name.find(activated_routed_moe_module) != -1:
+                    return True
+            return False
+
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                total_params += param.numel()
+                if not name.find(
+                    routed_moe_module_name
+                ) == -1 or is_activated_routed_moe_module(name):
+                    activated_params += param.numel()
+        return total_params, activated_params
 
     def forward(
         self,
@@ -107,6 +132,21 @@ class DeepSeekModelForCausalLM(nn.Module):
             logits = self.lm_head(x[:, [-1], :])
             loss = None
         return logits, loss, past_key_value
+    
+    @torch.no_grad()
+    def generate(self, input: torch.tensor, max_length: int, temperature: float = 1.0):
+        x = input
+        kv_cache = KVCache(self.config.num_layers)
+        for _ in range(max_length):
+            # use kv cache
+            logits, _, kv_cache = self(x, past_key_value=kv_cache)
+            # [B, vocab_size]
+            logits = logits[:, -1, :] / temperature
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1)
+            x = next_token
+            input = torch.cat([input, next_token], dim=1)
+        return input
 
 
 if __name__ == "__main__":

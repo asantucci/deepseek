@@ -1,8 +1,8 @@
 {
     "d_model": 1024,
-    "nheads": 128,
-    "max_position_embeddings": 2,
-    "dropout": 0.0,
+    "nheads": 16,
+    "max_position_embeddings": 512,
+    "dropout": 0.1,
     "device": "cuda",
     "use_kv_cache": true,
     "q_lora_rank": null,
@@ -19,17 +19,17 @@
         "training_context_length": 128
     },
     "v_head_dim": 128,
-    "num_shared_experts": 1,
-    "num_routed_experts": 1,
-    "moe_hidden_dimension": 20,
-    "mlp_hidden_dimension": 20,
-    "topk": 1,
+    "num_shared_experts": 2,
+    "num_routed_experts": 64,
+    "moe_hidden_dimension": 1024,
+    "mlp_hidden_dimension": 4096,
+    "topk": 6,
     "topk_norm_epsilon": 1e-9,
     "rms_norm_eps": 1e-6,
     "normalized_moe_gates": true,
     "expert_load_balance_factor": 0.01,
-    "num_layers": 1,
-    "vocab_size": 10000,
+    "num_layers": 4,
+    "vocab_size": 101024,
     "init_weight_std": 0.006,
-    "first_k_dense_replace": 0
+    "first_k_dense_replace": 1
 }
