@@ -205,6 +205,8 @@ def train(args):
             )
             loss = loss / args.gradient_accumulation_steps
             loss.backward()
+        if args.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         if (iter_num + 1) % args.eval_interval == 0:
@@ -315,7 +317,7 @@ if __name__ == "__main__":
 
     args.add_argument("--wandb-log", type=bool, default=True)
     args.add_argument("--wandb-project", type=str, default="deepseek training")
-    args.add_argument("--wandb-run-name", type=str, default="grad_accum_8_1_dropout_1")
+    args.add_argument("--wandb-run-name", type=str, default="grad_accum_8_1_dropout_4_clip_1")
 
     args.add_argument("--adamw-use-fused", type=bool, default=True)
 
@@ -328,11 +330,13 @@ if __name__ == "__main__":
 
     args.add_argument("--out-dir", type=str, default="output")
     args.add_argument("--resume", type=bool, default=False)
-    args.add_argument("--checkpoint-path", type=str, default="grad_accum_8_with_dropout_1_ckpt.pt")
+    args.add_argument("--checkpoint-path", type=str, default="grad_accum_8_with_dropout_4_clip_1_ckpt.pt")
 
     # adamw arguments
     args.add_argument("--adamw-beta1", type=float, default=0.9)
     args.add_argument("--adamw-beta2", type=float, default=0.95)
     args.add_argument("--adamw-weight-decay", type=float, default=0.1)
+    
+    args.add_argument("--grad-clip", type=float, default=1.0)
 
     main(args.parse_args())

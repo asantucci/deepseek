@@ -2,7 +2,7 @@
     "d_model": 1024,
     "nheads": 16,
     "max_position_embeddings": 512,
-    "dropout": 0.1,
+    "dropout": 0.4,
     "device": "cuda",
     "use_kv_cache": true,
     "q_lora_rank": null,
