@@ -10,6 +10,7 @@ import torch.nn as nn
 import time
 import math
 from contextlib import nullcontext
+import bitsandbytes as bnb
 
 
 ptdtype = {
@@ -19,7 +20,9 @@ ptdtype = {
 }
 
 
-def configure_optimizers(model, weight_decay, learning_rate, betas, device_type, fused):
+def configure_optimizers(
+    model, weight_decay, learning_rate, betas, fused, use_eight_bit_optimizer=False
+):
     # start with all of the candidate parameters
     param_dict = {pn: p for pn, p in model.named_parameters()}
     # filter out those that do not require grad
@@ -41,9 +44,15 @@ def configure_optimizers(model, weight_decay, learning_rate, betas, device_type,
         f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters"
     )
     # Create AdamW optimizer and use the fused version if it is available
-    optimizer = torch.optim.AdamW(
-        optim_groups, lr=learning_rate, betas=betas, fused=fused
-    )
+    if use_eight_bit_optimizer:
+        # fuse is not supported
+        optimizer = bnb.optim.AdamW8bit(
+            optim_groups, lr=learning_rate, betas=betas
+        )
+    else:
+        optimizer = torch.optim.AdamW(
+            optim_groups, lr=learning_rate, betas=betas, fused=fused
+        )
     return optimizer
 
 
@@ -165,7 +174,14 @@ def train(args):
         data_dir, "train", args.batch_size, args.max_position_embeddings, args.device
     )
     model = get_model(args)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, fused=args.adamw_use_fused)
+    optimizer = configure_optimizers(
+        model,
+        args.adamw_weight_decay,
+        args.learning_rate,
+        (args.adamw_beta1, args.adamw_beta2),
+        args.adamw_use_fused,
+        args.use_eight_bit_optimizer,
+    )
     optimizer.zero_grad(set_to_none=True)
     best_val_loss = 1e9
     iter_num = 0
@@ -238,7 +254,9 @@ def train(args):
                         "best_val_loss": best_val_loss,
                         "training_args": args,
                     }
-                    torch.save(checkpoint, os.path.join(args.out_dir, args.checkpoint_path))
+                    torch.save(
+                        checkpoint, os.path.join(args.out_dir, args.checkpoint_path)
+                    )
             print(
                 f"step {iter_num+1}: train loss: {losses['train']:.4f}, val loss: {losses['val']:.4f}"
             )
@@ -317,7 +335,9 @@ if __name__ == "__main__":
 
     args.add_argument("--wandb-log", type=bool, default=True)
     args.add_argument("--wandb-project", type=str, default="deepseek training")
-    args.add_argument("--wandb-run-name", type=str, default="grad_accum_8_1_dropout_4_clip_1")
+    args.add_argument(
+        "--wandb-run-name", type=str, default="8_bit_optimizer"
+    )
 
     args.add_argument("--adamw-use-fused", type=bool, default=True)
 
@@ -330,13 +350,18 @@ if __name__ == "__main__":
 
     args.add_argument("--out-dir", type=str, default="output")
     args.add_argument("--resume", type=bool, default=False)
-    args.add_argument("--checkpoint-path", type=str, default="grad_accum_8_with_dropout_4_clip_1_ckpt.pt")
+    args.add_argument(
+        "--checkpoint-path",
+        type=str,
+        default="8_bit_optimizer_ckpt.pt",
+    )
 
     # adamw arguments
     args.add_argument("--adamw-beta1", type=float, default=0.9)
     args.add_argument("--adamw-beta2", type=float, default=0.95)
     args.add_argument("--adamw-weight-decay", type=float, default=0.1)
-    
+    args.add_argument("--use-eight-bit-optimizer", type=bool, default=True)
+
     args.add_argument("--grad-clip", type=float, default=1.0)
 
     main(args.parse_args())
