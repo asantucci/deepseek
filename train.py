@@ -11,7 +11,13 @@ import time
 import math
 from contextlib import nullcontext
 import bitsandbytes as bnb
+from enum import Enum
+from dataloader import TinyShakespeareDataLoader, FineWebEduDataLoader, DataLoader
 
+
+class DatasetName(Enum):
+    TINY_SHAKESPEARE = "tinyshakespeare"
+    FINE_WEB_EDU = "fineweb_edu"
 
 ptdtype = {
     "float32": torch.float32,
@@ -71,61 +77,30 @@ def get_lr(it, warmup_iters, lr_decay_iters, learning_rate, min_lr):
     return min_lr + coeff * (learning_rate - min_lr)
 
 
-def get_batch(data_dir, split, batch_size, max_position_embeddings, device):
-    # We recreate np.memmap every batch to avoid a memory leak, as per
-    # https://stackoverflow.com/questions/45132940/numpy-memmap-memory-usage-want-to-iterate-once/61472122#61472122
-    if split == "train":
-        data = np.memmap(os.path.join(data_dir, "train.bin"), dtype=np.uint16, mode="r")
+def get_dataloader(dataset_name, split, batch_size, seq_len, device):
+    if dataset_name == DatasetName.TINY_SHAKESPEARE.value:
+        dataloader = TinyShakespeareDataLoader(batch_size, seq_len, split, device)
+    elif dataset_name == DatasetName.FINE_WEB_EDU.value:
+        dataloader = FineWebEduDataLoader(batch_size, seq_len, split, device)
     else:
-        data = np.memmap(os.path.join(data_dir, "val.bin"), dtype=np.uint16, mode="r")
-    ix = torch.randint(len(data) - max_position_embeddings, (batch_size,))
-    x = torch.stack(
-        [
-            torch.from_numpy((data[i : i + max_position_embeddings]).astype(np.int64))
-            for i in ix
-        ]
-    )
-    y = torch.stack(
-        [
-            torch.from_numpy(
-                (data[i + 1 : i + 1 + max_position_embeddings]).astype(np.int64)
-            )
-            for i in ix
-        ]
-    )
-    if device == "cuda":
-        # pin arrays x,y, which allows us to move them to GPU asynchronously (non_blocking=True)
-        # make the tensors in the non-pageable area
-        x, y = x.pin_memory().to(device, non_blocking=True), y.pin_memory().to(
-            device, non_blocking=True
-        )
-    else:
-        x, y = x.to(device), y.to(device)
-    return x, y
+        raise ValueError(f"Dataset {dataset_name} is not supported")
+    return dataloader
 
 
 @torch.no_grad()
 def evalaute(
     model: nn.Module,
     eval_iters: int,
-    data_dir: str,
-    batch_size: int,
-    max_position_embeddings: int,
-    device: str,
+    eval_dataloader: DataLoader,
 ):
     model.eval()
-    losses = {}
-    for split in ["train", "val"]:
-        cur_loss = torch.zeros(eval_iters)
-        for i in range(eval_iters):
-            x, y = get_batch(
-                data_dir, split, batch_size, max_position_embeddings, device
-            )
-            _, loss, _ = model(x, y)
-            cur_loss[i] = loss.item()
-        losses[split] = cur_loss.mean()
+    losses = torch.zeros(eval_iters)
+    for i in range(eval_iters):
+        x, y = eval_dataloader.next_batch()
+        _, loss, _ = model(x, y)
+        losses[i] = loss.item()
     model.train()
-    return losses
+    return losses.mean()
 
 
 def get_model_config(args):
@@ -169,10 +144,8 @@ def train(args):
             name=args.wandb_run_name,
             config=get_wandb_config(args),
         )
-    data_dir = os.path.join("data", args.dataset)
-    x, y = get_batch(
-        data_dir, "train", args.batch_size, args.max_position_embeddings, args.device
-    )
+    train_loader = get_dataloader(args.dataset, "train", args.batch_size, args.max_position_embeddings, args.device)
+    val_loader = get_dataloader(args.dataset, "val", args.batch_size, args.max_position_embeddings, args.device)
     model = get_model(args)
     optimizer = configure_optimizers(
         model,
@@ -210,41 +183,32 @@ def train(args):
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
         for _ in range(args.gradient_accumulation_steps):
+            x, y = train_loader.next_batch()
             with ctx:
-                _, loss, _ = model(x, y)
-            x, y = get_batch(
-                data_dir,
-                "train",
-                args.batch_size,
-                args.max_position_embeddings,
-                args.device,
-            )
-            loss = loss / args.gradient_accumulation_steps
-            loss.backward()
+                _, train_loss, _ = model(x, y)
+            train_loss = train_loss / args.gradient_accumulation_steps
+            train_loss.backward()
         if args.grad_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
         if (iter_num + 1) % args.eval_interval == 0:
-            losses = evalaute(
+            val_loss = evalaute(
                 model,
                 args.eval_iters,
-                data_dir,
-                args.batch_size,
-                args.max_position_embeddings,
-                args.device,
+                val_loader,
             )
             if args.wandb_log:
                 wandb.log(
                     {
                         "Step": iter_num,
-                        "Train Loss": losses["train"],
-                        "Val Loss": losses["val"],
+                        "Train Loss": train_loss.item(),
+                        "Val Loss": val_loss,
                         "Learning Rate": lr,
                     }
                 )
-            if losses["val"] < best_val_loss:
-                best_val_loss = losses["val"]
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
                 if iter_num > 0:
                     checkpoint = {
                         "model": model.state_dict(),
@@ -258,7 +222,7 @@ def train(args):
                         checkpoint, os.path.join(args.out_dir, args.checkpoint_path)
                     )
             print(
-                f"step {iter_num+1}: train loss: {losses['train']:.4f}, val loss: {losses['val']:.4f}"
+                f"step {iter_num+1}: train loss: {train_loss.item():.4f}, val loss: {val_loss:.4f}"
             )
         iter_num += 1
 
@@ -291,14 +255,9 @@ def estimate_throughput(args):
     total_time = 0
     torch.cuda.synchronize()
     start_time = time.time()
+    train_loader = get_dataloader(args.dataset, "train", args.batch_size, args.max_position_embeddings, args.device)
     for i in range(args.max_train_steps):
-        x, y = get_batch(
-            data_dir,
-            "train",
-            args.batch_size,
-            args.max_position_embeddings,
-            args.device,
-        )
+        x, y = train_loader.next_batch()
         forward_and_backward(model, x, y, optimizer)
         total_tokens += x.shape[0] * x.shape[1]
     torch.cuda.synchronize()
@@ -320,7 +279,7 @@ def main(args):
 if __name__ == "__main__":
     args = argparse.ArgumentParser()
     args.add_argument("--device", type=str, default="cuda")
-    args.add_argument("--dataset", type=str, default="tinyshakespeare")
+    args.add_argument("--dataset", type=str, default="fineweb_edu")
 
     args.add_argument("--warmup-steps", type=int, default=20)
     args.add_argument("--learning-rate", type=float, default=5e-4)
