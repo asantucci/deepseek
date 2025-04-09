@@ -99,6 +99,7 @@ def evalaute(
     eval_dataloader: DataLoader,
     cur_train_iter: iter,
     cur_eval_iter: iter,
+    device: str,
 ):
     model.eval()
     loss_iters = torch.zeros(eval_iters)
@@ -106,20 +107,20 @@ def evalaute(
     for i in range(eval_iters):
         eval_batch, cur_eval_iter = get_next_batch(eval_dataloader, cur_eval_iter)
         _, loss, _ = model(
-            x = eval_batch["input_ids"],
-            targets = eval_batch["labels"],
+            x = eval_batch["input_ids"].to(device),
+            targets = eval_batch["labels"].to(device),
             past_key_value = None,
-            attention_mask = eval_batch["attention_mask"],
+            attention_mask = eval_batch["attention_mask"].to(device),
         )
         loss_iters[i] = loss.item()
     losses["eval"] = loss_iters.mean()
     for i in range(eval_iters):
         train_batch, cur_train_iter = get_next_batch(train_dataloader, cur_train_iter)
         _, loss, _ = model(
-            x = train_batch["input_ids"],
-            targets = train_batch["labels"],
+            x = train_batch["input_ids"].to(device),
+            targets = train_batch["labels"].to(device),
             past_key_value = None,
-            attention_mask = train_batch["attention_mask"],
+            attention_mask = train_batch["attention_mask"].to(device),
         )
         loss_iters[i] = loss.item()
     losses["train"] = loss_iters.mean()
@@ -235,9 +236,10 @@ class Trainer:
                     model,
                     self.training_config.eval_iters,
                     self.train_dataloader,
-                    cur_train_iter,
                     self.eval_dataloader,
+                    cur_train_iter,
                     cur_eval_iter,
+                    self.training_config.device,
                 )
                 if self.training_config.wandb_log:
                     wandb.log(
