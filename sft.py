@@ -1,211 +1,88 @@
 # to format: black --line-length 88 sft.py
 
 from dataclasses import dataclass
-import jinja2
 from tokenizer import Tokenizer
-import argparse
-import torch
+import datasets
+from torch.utils.data import DataLoader, Dataset
+import json
+from training_config import TrainingConfig
+from trainer import Trainer
+from datacollator import DataCollatorForChatMl, ChatMlSpecialTokens
 
+# Define a custom PyTorch Dataset
+class SFTDataset(Dataset):
+    def __init__(self, dataset):
+        self.dataset = dataset
 
-# reference: https://github.com/huggingface/trl/blob/main/trl/models/utils.py#L44
-@dataclass
-class ChatMlSpecialTokens:
-    """Dataclass for special tokens used in ChatML, including system, user, assistant, bos, eos, and pad tokens."""
+    def __len__(self):
+        return len(self.dataset)
 
-    bos_token: str = "<|im_start|>"
-    eos_token: str = "<|im_end|>"
-    pad_token: str = "<|im_end|>"
-
-    @property
-    def assistant(self):
-        return f"{self.bos_token}assistant"
-
-    @property
-    def chat_template(self):
-        """
-        the jinja2 template for the chatml format
-        """
-        return (
-            "{% for message in messages %}"
-            f"{{{{'{self.bos_token}' + message['role'] + '\n' + message['content'] + '{self.eos_token}' + '\n'}}}}"
-            "{% endfor %}"
-            "{% if add_generation_prompt %}"
-            f"{{{{ '{self.assistant}\n' }}}}"
-            "{% endif %}"
-        )
-
-
-def format_input_text(input: list[dict[str, str]], add_generation_prompt: bool = False):
-    """
-    format the input text with chat template to differentiate among different roles
-
-    an exmple of input:
-    [
-        {"role": "user", "content": "Hello, how are you?"},
-        {"role": "assistant", "content": "I'm fine, thank you!"},
-        {"role": "user", "content": "What is the capital of France?"},
-    ]
-
-    when add_generation_prompt is False, the output should be:
-    <|im_start|>user
-    Hello, how are you?<|im_end|>
-    <|im_start|>assistant
-    I'm fine, thank you!<|im_end|>
-    <|im_start|>user
-    What is the capital of France?<|im_end|>
-
-    when add_generation_prompt is True, the output should be:
-    <|im_start|>user
-    Hello, how are you?<|im_end|>
-    <|im_start|>assistant
-    I'm fine, thank you!<|im_end|>
-    <|im_start|>assistant
-    """
-
-    template = jinja2.Template(ChatMlSpecialTokens().chat_template)
-    return template.render(messages=input, add_generation_prompt=add_generation_prompt)
-
-
-def pad(examples: list[torch.Tensor], pad_value: int):
-    """
-    pad the input text to the max length of the batch
-    """
-    max_length = max(len(example) for example in examples)
-    print(f"pad value: {pad_value}")
-    padded_examples = [
-        torch.cat([example, torch.full((max_length - len(example),), pad_value)])
-        for example in examples
-    ]
-    return padded_examples
-
-
-class DataCollatorForChatMl:
-    """
-    The data collator will primary do three things:
-    1. format the input text with chat template
-    2. pad the input text to the max length of the batch
-    3. set the label values for the non-assistant response tokens as ignore_index
-    """
-
-    def __init__(
-        self,
-        tokenizer: Tokenizer,
-        pad_token_id: int,
-        ignore_index: int,
-        assistant_response_format: str,
-        end_token: str,
-    ):
-        self.tokenizer = tokenizer
-        self.pad_token_id = pad_token_id
-        self.ignore_index = ignore_index
-        self.assistant_response_format = assistant_response_format
-        self.end_token = end_token
-
-    def process(self, examples: list[list[dict[str, str]]]):
-        """
-        process a batch of examples
-        """
-        formatted_examples = [format_input_text(example) for example in examples]
-        tokenized_examples = [
-            self.tokenizer.encode(example) for example in formatted_examples
-        ]
-        input_ids = [torch.tensor(example[:-1]) for example in tokenized_examples]
-        attention_mask = [torch.ones_like(input_id) for input_id in input_ids]
-        labels = [torch.tensor(example[1:]) for example in tokenized_examples]
-
-        input_ids = pad(input_ids, self.pad_token_id)
-        attention_mask = pad(attention_mask, 0)
-        labels = pad(labels, self.ignore_index)
-        # mask out the non-assistant response tokens in labels
-        labels = self.mask_labels(labels)
-        batch = {
-            "input_ids": input_ids,
-            "labels": labels,
-            "attention_mask": attention_mask,
-        }
-        return batch
-
-    def mask_labels(self, labels: list[torch.Tensor]):
-        """
-        mask the labels for the non-assistant response tokens
-        """
-        response_ids = self.tokenizer.encode(self.assistant_response_format)
-        end_token_id = self.tokenizer.encode(self.end_token)[0]
-        for label in labels:
-            start_ind = 0
-            prev_assistant_response = False
-            i = 0
-            while i < len(label):
-                if i < len(label) - len(response_ids) and torch.equal(
-                    label[i : i + len(response_ids)], torch.tensor(response_ids)
-                ):
-                    label[start_ind : i + len(response_ids)] = self.ignore_index
-                    i += len(response_ids)
-                    prev_assistant_response = True
-                elif (
-                    torch.equal(label[i], torch.tensor(end_token_id))
-                    and prev_assistant_response
-                ):
-                    start_ind = i + 1
-                    prev_assistant_response = False
-                    i += 1
-                else:
-                    i += 1
-            label[start_ind:] = self.ignore_index
-        return labels
+    def __getitem__(self, idx):
+        return self.dataset[idx]["messages"]
 
 
 if __name__ == "__main__":
-    args = argparse.ArgumentParser()
-    args.add_argument(
-        "--tokenizer_type",
-        type=str,
-        default="cl100k_base",
-        help="the type of the tokenizer in tiktoken library, the default is gpt4 tokenizer",
-    )
-
-    args = args.parse_args()
-    tokenizer = Tokenizer(args.tokenizer_type)
-
+    sft_training_config_file = "sft.json"
+    with open(sft_training_config_file, "r") as f:
+        training_config = json.load(f)
+    sft_training_config = TrainingConfig(**training_config)
+    
+    tokenizer = Tokenizer(sft_training_config.tokenizer_type)
     tokenizer.add_special_tokens(
         [ChatMlSpecialTokens().bos_token, ChatMlSpecialTokens().eos_token]
     )
-    messages = [
-        [
-            {"role": "user", "content": "Hello, how are you?"},
-            {"role": "assistant", "content": "I'm fine, thank you!"},
-            {"role": "user", "content": "What is the capital of France?"},
-        ],
-        [
-            {"role": "user", "content": "what is up?"},
-            {"role": "assistant", "content": "not much, just chilling"},
-            {"role": "user", "content": "what is your name?"},
-        ],
-    ]
+    # load huggingface dataset
+    train_dataset = datasets.load_dataset(sft_training_config.dataset_name, split=sft_training_config.train_split)
+    eval_dataset = datasets.load_dataset(sft_training_config.dataset_name, split=sft_training_config.eval_split)
 
-    formatted_input = format_input_text(messages[0])
-    print(f"formatted_input: {formatted_input}")
+    sft_train_dataset = SFTDataset(train_dataset)
+    sft_eval_dataset = SFTDataset(eval_dataset)
 
-    token_ids = tokenizer.encode(formatted_input)
-    print(f"token_ids: {token_ids}")
-
-    token_strs = tokenizer.decode(token_ids)
-    print(f"token_strs: {token_strs}")
-
-    bos = ChatMlSpecialTokens().bos_token
-    bos_encoded = tokenizer.encode(bos)
-    print(f"bos_encoded: {bos_encoded}")
-
-    eos = ChatMlSpecialTokens().eos_token
-    eos_encoded = tokenizer.encode(eos)[0]
-    print(f"eos_encoded: {eos_encoded}")
-
+    # create the datacollator
     data_collator = DataCollatorForChatMl(
         tokenizer,
-        eos_encoded,
+        tokenizer.eos_token_id,
+        # pytorch cross entropy loss will ignore labels with value -100
+        # https://pytorch.org/docs/stable/generated/torch.nn.CrossEntropyLoss.html
         -100,
         ChatMlSpecialTokens().assistant,
-        ChatMlSpecialTokens().eos_token,
+        tokenizer.eos_token_id,
     )
-    batch = data_collator.process(messages)
-    print(f"batch: {batch}")
+
+    # create dataloader
+    sft_train_dataloader = DataLoader(
+        sft_train_dataset,
+        batch_size=sft_training_config.batch_size,
+        shuffle=True,
+        collate_fn=data_collator.process,
+    )
+    sft_eval_dataloader = DataLoader(
+        sft_eval_dataset,
+        batch_size=sft_training_config.batch_size,
+        shuffle=True,
+        collate_fn=data_collator.process,
+    )
+    
+    # max_len = 0
+    # train_batch_size = 0
+    # eval_batch_size = 0
+    # for batch in sft_train_dataloader:
+    #     input_ids = batch['input_ids']
+    #     max_len = max(max_len, input_ids.shape[1])
+    #     train_batch_size += 1
+    #     if train_batch_size % 100 == 0:
+    #         print(f"train_batch_size: {train_batch_size}")
+    # for batch in sft_eval_dataloader:
+    #     input_ids = batch['input_ids']
+    #     max_len = max(max_len, input_ids.shape[1])
+    #     eval_batch_size += 1
+    #     if eval_batch_size % 100 == 0:
+    #         print(f"eval_batch_size: {eval_batch_size}")
+    # print(f"max_len: {max_len}")
+    
+    sft_trainer = Trainer(
+        sft_train_dataloader,
+        sft_eval_dataloader,
+        sft_training_config,
+    )
+    sft_trainer.train()

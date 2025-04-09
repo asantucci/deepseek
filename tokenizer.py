@@ -6,6 +6,7 @@ class Tokenizer:
         self.tokenizer_type = tokenizer_type
         self.tokenizer = tiktoken.get_encoding(tokenizer_type)
         self.allowed_special = set()
+        self.eos_token_id = None
     
     def get_token_id(self, token: str):
         '''
@@ -41,6 +42,7 @@ class Tokenizer:
         )
         self.tokenizer = enc
         self.allowed_special = set(special_tokens.keys())
+        self.eos_token_id = special_tokens["<|im_end|>"]
         
     def print_special_tokens(self):
         '''

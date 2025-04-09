@@ -300,7 +300,7 @@ if __name__ == "__main__":
 
     args.add_argument("--adamw-use-fused", type=bool, default=True)
 
-    args.add_argument("--max-train-steps", type=int, default=3000)
+    args.add_argument("--max-train-steps", type=int, default=30000)
     args.add_argument("--batch-size", type=int, default=8)
     args.add_argument("--gradient-accumulation-steps", type=int, default=8)
     args.add_argument("--warmup-iters", type=int, default=500)

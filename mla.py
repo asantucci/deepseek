@@ -345,6 +345,36 @@ class KVCache(object):
         return self.key_cache[layer_idx].shape[-2]
 
 
+def get_attention_mask(attn_mask: torch.tensor):
+    """
+    Args:
+        attn_mask: (B, T)
+    Returns:
+        attn_mask: (B, 1, T, T)
+    """
+    batch_size, seq_length = attn_mask.shape
+
+    # Create the outer product of attention_mask with itself for each batch
+    attn_mask = attn_mask.to(torch.float32)
+    mask_matrix = attn_mask.unsqueeze(-1) @ attn_mask.unsqueeze(1)
+
+    # Create a causal mask (lower triangular)
+    causal_mask = torch.tril(
+        torch.ones(seq_length, seq_length, device=attn_mask.device)
+    )
+
+    # Combine the attention mask with the causal mask
+    # A position is valid if both:
+    # 1. Both tokens are real (from the attention mask)
+    # 2. The position is in the lower triangle (from the causal mask)
+    mask_matrix = mask_matrix * causal_mask.unsqueeze(0)
+
+    # Convert to boolean
+    mask_matrix = mask_matrix.bool().unsqueeze(1)
+
+    return mask_matrix
+
+
 class MultiHeadLatentAttention(nn.Module):
     def __init__(self, config: DeepSeekConfig, layer_idx: int):
         super().__init__()
@@ -437,6 +467,7 @@ class MultiHeadLatentAttention(nn.Module):
         self,
         x: torch.Tensor,
         past_key_value: Optional[KVCache] = None,
+        attn_mask: Optional[torch.tensor] = None,
     ):
         B, q_len = x.shape[:2]
 
@@ -505,11 +536,8 @@ class MultiHeadLatentAttention(nn.Module):
 
         # when the q_len = kv_seq_len, the attention mask is casual mask
         # otherwise, the query can attend to all past tokens, so the attention bias is all 0
-        attn_mask = None
         if q_len == kv_seq_len:
-            attn_mask = torch.tril(
-                torch.ones(q_len, q_len, device=x.device), diagonal=0
-            ).bool()
+            attn_mask = get_attention_mask(attn_mask)
         # B, nheads, q_len, v_head_dim
         output = F.scaled_dot_product_attention(
             query_states,

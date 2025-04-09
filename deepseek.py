@@ -8,6 +8,7 @@ from typing import Optional
 from mla import KVCache
 import json
 
+
 class Block(nn.Module):
     def __init__(self, config: DeepSeekConfig, block_idx: int):
         super().__init__()
@@ -22,17 +23,25 @@ class Block(nn.Module):
             config.d_model, eps=config.rms_norm_eps
         )
 
-    def forward(self, x: torch.tensor, past_key_value: Optional[KVCache] = None):
+    def forward(
+        self,
+        x: torch.tensor,
+        past_key_value: Optional[KVCache] = None,
+        attention_mask: Optional[torch.tensor] = None,
+    ):
         """
         args:
             x: (B, T, d_model)
             past_key_value (KVCache, optional): when it is None, KV cache will not be used
+            attention_mask (torch.tensor, optional): (B, T)
         return:
             x: (B, T, d_model)
             past_key_value (KVCache, optional): None or updated KVCache.
         """
         identity = x
-        x, past_key_value = self.self_attn(self.input_layernorm(x), past_key_value)
+        x, past_key_value = self.self_attn(
+            self.input_layernorm(x), past_key_value, attention_mask
+        )
         if past_key_value is not None:
             print(f"past_key_value shape: {past_key_value.key_cache[0].shape}")
         x = identity + x
@@ -56,11 +65,14 @@ class DeepSeekModel(nn.Module):
         self,
         x: torch.tensor,
         past_key_value: Optional[KVCache] = None,
+        attention_mask: Optional[torch.tensor] = None,
     ) -> torch.tensor:
         """
         Args:
             x: (B, T)
-            target: (B, T)
+            targets: (B, T)
+            past_key_value: (KVCache, optional)
+            attention_mask: (B, T)
         return: (B, T, vocab_size)
         """
         B, T = x.shape
@@ -71,7 +83,7 @@ class DeepSeekModel(nn.Module):
         x = self.embed_tokens(x)
         x = self.dropout(x)
         for layer in self.layers:
-            x, past_key_value = layer(x, past_key_value)
+            x, past_key_value = layer(x, past_key_value, attention_mask)
         return self.norm(x), past_key_value
 
 
@@ -93,7 +105,7 @@ class DeepSeekModelForCausalLM(nn.Module):
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
             module.weight.data.normal_(mean=0.0, std=self.init_weight_std)
-            
+
     def get_total_parameters(self):
         total_params = 0
         activated_params = 0
@@ -122,8 +134,16 @@ class DeepSeekModelForCausalLM(nn.Module):
         x: torch.tensor,
         targets: torch.tensor = None,
         past_key_value: Optional[KVCache] = None,
+        attention_mask: Optional[torch.tensor] = None,
     ) -> torch.tensor:
-        x, past_key_value = self.model(x, past_key_value)
+        """
+        Args:
+            x: (B, T)
+            targets: (B, T)
+            past_key_value: (KVCache, optional)
+            attention_mask: (B, T)
+        """
+        x, past_key_value = self.model(x, past_key_value, attention_mask)
         if targets is not None:
             logits = self.lm_head(x)
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
@@ -132,7 +152,7 @@ class DeepSeekModelForCausalLM(nn.Module):
             logits = self.lm_head(x[:, [-1], :])
             loss = None
         return logits, loss, past_key_value
-    
+
     @torch.no_grad()
     def generate(self, input: torch.tensor, max_length: int, temperature: float = 1.0):
         x = input
