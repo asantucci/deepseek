@@ -1,65 +1,73 @@
-from datasets import load_dataset
+import argparse
 import os
-import tiktoken
 import numpy as np
 import multiprocessing as mp
 from tqdm import tqdm
+
+from datasets import load_dataset
+import tiktoken
+
+parser = argparse.ArgumentParser(
+    prog="Downloads & Tokenizes FineWeb 10BT Sample",
+    usage="python3 fineweb_edu.py --cache_dir='<dir>'"
+)
+parser.add_argument('--cache_dir', type=str, default='~/data/edu_fineweb10B')
+args = parser.parse_args()
+args.cache_dir = os.path.expanduser(args.cache_dir)
+
 dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train")
 
-local_dir = "edu_fineweb10B"
 remote_name = "sample-10BT"
-shard_size = int(1e8) # 100M tokens per shard, total of 100 shards
-fineweb_edu = "fineweb_edu"
+shard_size = int(1e8) # 100M tokens per shard, total of 100 shards.
+os.makedirs(args.cache_dir, exist_ok=True)
 
-# create the cache the local directory if it doesn't exist yet
-DATA_CACHE_DIR = os.path.join(os.path.dirname(__file__), local_dir)
-os.makedirs(DATA_CACHE_DIR, exist_ok=True)
-
-# encode with tiktoken gpt4 bpe
+# Encode with tiktoken gpt4 bpe.
 enc = tiktoken.get_encoding("cl100k_base")
-eot = enc._special_tokens['<|endoftext|>'] # end of text token
+eot = enc._special_tokens['<|endoftext|>'] # End of text token.
 
 def tokenize(doc):
-    # tokenizes a single document and returns a numpy array of int32 tokens
-    tokens = [eot] # the special <|endoftext|> token delimits all documents
+    """Tokenize a single document with <|endoftext|> prepended."""
+    tokens = [eot] # The special <|endoftext|> token delimits all documents.
     tokens.extend(enc.encode_ordinary(doc["text"]))
     return np.array(tokens, dtype=np.int32)
 
-def save_shard(filename, tokens):
-    np.save(filename, tokens)
-    
-nprocs = max(1, os.cpu_count()//2)
+def save_shard(path, tokens):
+    """Saves token array to disk."""
+    np.save(path, tokens)
 
-with mp.Pool(nprocs) as pool:
+def process_and_shard(dataset, shard_size, out_dir, prefix):
+    """Tokenizes a dataset and shards."""
+    nprocs = max(1, os.cpu_count() // 2)
     shard_idx = 0
-    # pre-allocate the buffer for shard
+    token_count = 0
     shard_buffer = np.empty(shard_size, dtype=np.int32)
-    token_cnt = 0
     progress_bar = None
-    # each process will handle a chunk size of 16 documents to tokenize them in parallel
-    # tokens in the for loop are the tokenized results for 16 * nprocs documents
-    for tokens in pool.imap(tokenize, dataset, chunksize=16):
-        if token_cnt + len(tokens) < shard_size:
-            shard_buffer[token_cnt:token_cnt+len(tokens)] = tokens
-            token_cnt += len(tokens)
-            if progress_bar is None:
-                progress_bar = tqdm(total=shard_size, unit="tokens", desc=f"shard: {shard_idx:06d}")
-            progress_bar.update(len(tokens))
-        else:
-            split = "val" if shard_idx == 0 else "train"
-            reminder = shard_size - token_cnt
-            progress_bar.update(reminder)
-            shard_buffer[token_cnt:token_cnt+reminder] = tokens[:reminder]
-            file_path = os.path.join(DATA_CACHE_DIR, f"{fineweb_edu}_{split}_{shard_idx:06d}")
-            # save the full shard
-            save_shard(file_path, shard_buffer)
-            shard_idx += 1
-            token_cnt = len(tokens) - reminder
-            shard_buffer[:token_cnt] = tokens[reminder:]
-            progress_bar = None
-    if token_cnt > 0:
-        split = "val" if shard_idx == 0 else "train"
-        file_path = os.path.join(DATA_CACHE_DIR, f"{fineweb_edu}_{split}_{shard_idx:06d}")
-        save_shard(file_path, shard_buffer[:token_cnt])
 
+    with mp.Pool(nprocs) as pool:
+        for tokens in pool.imap(tokenize, dataset, chunksize=16):
+            remaining = shard_size - token_count
 
+            if len(tokens) <= remaining:
+                shard_buffer[token_count:token_count+len(tokens)] = tokens
+                token_count += len(tokens)
+                if progress_bar is None:
+                    progress_bar = tqdm(total=shard_size, unit="tokens", desc=f"shard: {shard_idx:06d}")
+                progress_bar.update(len(tokens))
+            else:
+                # Fills the remaining part of the current shard.
+                shard_buffer[token_count:] = tokens[:remaining]
+                progress_bar.update(remaining)
+
+                # Save the completed shard.
+                split = "val" if shard_idx == 0 else "train"
+                shard_path = os.path.join(out_dir, f"{prefix}_{split}_{shard_idx:06d}")
+                save_shard(shard_path, shard_buffer)
+
+                shard_idx += 1
+                progress_bar.close()
+                progress_bar = None
+
+                # Start new shard with leftover tokens
+                leftover = tokens[remaining:]
+                token_count = len(leftover)
+                shard_buffer[:token_count] = leftover
