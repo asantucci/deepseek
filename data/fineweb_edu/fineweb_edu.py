@@ -13,7 +13,7 @@ parser = argparse.ArgumentParser(
 )
 parser.add_argument('--cache_dir', type=str, default='~/data/edu_fineweb10B')
 parser.add_argument('--shard_prefix', type=str, default='fineweb_edu')
-parser.add_argument('--tokens_per_shard', type=int, default=1e8)  # With 100M tokens/shard, there are 100 shards using our FineWeb10BT sample.
+parser.add_argument('--tokens_per_shard', type=int, default=int(1e8))  # With 100M tokens/shard, there are ~100 shards using our FineWeb10BT sample.
 args = parser.parse_args()
 args.cache_dir = os.path.expanduser(args.cache_dir)
 
@@ -75,6 +75,7 @@ def process_and_shard(dataset, shard_size, out_dir, prefix):
 
         # Saves any remaining tokens in the last shard.
         if token_count > 0:
+            print(f'Now saving the remaining tokens in final shard.')
             split = "val" if shard_idx == 0 else "train"
             shard_path = os.path.join(out_dir, f"{prefix}_{split}_{shard_idx:06d}")
             save_shard(shard_path, shard_buffer[:token_count])

@@ -6,7 +6,7 @@ import datasets
 from torch.utils.data import DataLoader, Dataset
 import json
 from training_config import TrainingConfig
-from trainer import Trainer
+from train import Trainer
 from datacollator import DataCollatorForChatMl, ChatMlSpecialTokens
 
 # Define a custom PyTorch Dataset

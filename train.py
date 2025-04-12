@@ -81,7 +81,7 @@ def get_dataloader(dataset_name, split, batch_size, seq_len, device):
     if dataset_name == DatasetName.TINY_SHAKESPEARE.value:
         dataloader = TinyShakespeareDataLoader(batch_size, seq_len, split, device)
     elif dataset_name == DatasetName.FINE_WEB_EDU.value:
-        dataloader = FineWebEduDataLoader(batch_size, seq_len, split, device)
+        dataloader = FineWebEduDataLoader('~/data/edu_fineweb10B', batch_size, seq_len, split, device)
     else:
         raise ValueError(f"Dataset {dataset_name} is not supported")
     return dataloader
@@ -159,7 +159,7 @@ def train(args):
     best_val_loss = 1e9
     iter_num = 0
     if args.resume:
-        checkpoint = torch.load(os.path.join(args.out_dir, "ckpt.pt"))
+        checkpoint = torch.load(os.path.join(os.path.expanduser(args.out_dir), "ckpt.pt"))
         config = checkpoint["model_config"]
         model = DeepSeekModelForCausalLM(config)
         model.to(args.device)
@@ -218,9 +218,9 @@ def train(args):
                         "best_val_loss": best_val_loss,
                         "training_args": args,
                     }
-                    torch.save(
-                        checkpoint, os.path.join(args.out_dir, args.checkpoint_path)
-                    )
+                    checkpoint_path = os.path.join(os.path.expanduser(args.out_dir), args.checkpoint_path)
+                    os.makedirs(os.path.expanduser(args.out_dir), mode=0o777, exist_ok=True)
+                    torch.save(checkpoint, checkpoint_path)
             print(
                 f"step {iter_num+1}: train loss: {train_loss.item():.4f}, val loss: {val_loss:.4f}"
             )
@@ -246,7 +246,6 @@ def estimate_throughput(args):
             name=args.wandb_run_name,
             config=get_wandb_config(args),
         )
-    data_dir = os.path.join("data", args.dataset)
     model = get_model(args)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.learning_rate, fused=args.adamw_use_fused
@@ -307,7 +306,7 @@ if __name__ == "__main__":
     args.add_argument("--lr-decay-iters", type=int, default=1000)
     args.add_argument("--decay-lr", type=bool, default=True)
 
-    args.add_argument("--out-dir", type=str, default="output")
+    args.add_argument("--out-dir", type=str, default="./data/sft")
     args.add_argument("--resume", type=bool, default=False)
     args.add_argument(
         "--checkpoint-path",

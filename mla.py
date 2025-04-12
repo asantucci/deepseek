@@ -536,7 +536,7 @@ class MultiHeadLatentAttention(nn.Module):
 
         # when the q_len = kv_seq_len, the attention mask is casual mask
         # otherwise, the query can attend to all past tokens, so the attention bias is all 0
-        if q_len == kv_seq_len:
+        if q_len == kv_seq_len and attn_mask is not None:
             attn_mask = get_attention_mask(attn_mask)
         # B, nheads, q_len, v_head_dim
         output = F.scaled_dot_product_attention(

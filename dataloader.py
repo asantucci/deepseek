@@ -76,11 +76,10 @@ class FineWebEduDataLoader(DataLoader):
     def __init__(self, prefix_dir, batch_size, seq_len, split, device, shuffle=True):
         """
         Loads FineWeb EDU-formatted tokenized data from:
-            {prefix_dir}/fineweb_edu/edu_fineweb10B/
+            {prefix_dir}/sample-10BT/
         """
-        data_dir = os.path.join(prefix_dir, "fineweb_edu", "edu_fineweb10B")
-        print(f"Loading FineWeb EDU data from {data_dir}")
-        super().__init__(data_dir, batch_size, seq_len, split, device, shuffle)
+        print(f"Loading FineWeb EDU data from {prefix_dir}")
+        super().__init__(prefix_dir, batch_size, seq_len, split, device, shuffle)
 
 
 class TinyShakespeareDataLoader(DataLoader):
