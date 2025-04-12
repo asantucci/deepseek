@@ -12,13 +12,14 @@ parser = argparse.ArgumentParser(
     usage="python3 fineweb_edu.py --cache_dir='<dir>'"
 )
 parser.add_argument('--cache_dir', type=str, default='~/data/edu_fineweb10B')
+parser.add_argument('--shard_prefix', type=str, default='fineweb_edu')
+parser.add_argument('--tokens_per_shard', type=int, default=1e8)  # With 100M tokens/shard, there are 100 shards using our FineWeb10BT sample.
 args = parser.parse_args()
 args.cache_dir = os.path.expanduser(args.cache_dir)
 
 dataset = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT", split="train")
 
 remote_name = "sample-10BT"
-shard_size = int(1e8) # 100M tokens per shard, total of 100 shards.
 os.makedirs(args.cache_dir, exist_ok=True)
 
 # Encode with tiktoken gpt4 bpe.
@@ -67,7 +68,19 @@ def process_and_shard(dataset, shard_size, out_dir, prefix):
                 progress_bar.close()
                 progress_bar = None
 
-                # Start new shard with leftover tokens
+                # Starts new shard with leftover tokens.
                 leftover = tokens[remaining:]
                 token_count = len(leftover)
                 shard_buffer[:token_count] = leftover
+
+        # Saves any remaining tokens in the last shard.
+        if token_count > 0:
+            split = "val" if shard_idx == 0 else "train"
+            shard_path = os.path.join(out_dir, f"{prefix}_{split}_{shard_idx:06d}")
+            save_shard(shard_path, shard_buffer[:token_count])
+            if progress_bar:
+                progress_bar.close()
+
+
+if __name__ == '__main__':
+    process_and_shard(dataset, args.tokens_per_shard, args.cache_dir, args.shard_prefix)

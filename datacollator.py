@@ -1,8 +1,10 @@
+import jinja2
+
+from dataclasses import dataclass
 import torch
 from tokenizer import Tokenizer
-import jinja2
-from dataclasses import dataclass
-# reference: https://github.com/huggingface/trl/blob/main/trl/models/utils.py#L44
+
+# Reference: https://github.com/huggingface/trl/blob/main/trl/models/utils.py#L44.
 @dataclass
 class ChatMlSpecialTokens:
     """Dataclass for special tokens used in ChatML, including system, user, assistant, bos, eos, and pad tokens."""
