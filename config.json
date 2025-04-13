@@ -7,16 +7,18 @@
     "use_kv_cache": true,
     "q_lora_rank": null,
     "kv_lora_rank": 512,
-    "rope_head_dim": 64,
     "nope_head_dim": 128,
-    "rope_base": 10000,
-    "rope_scaling": {
-        "type": "yarn",
-        "scaling_factor": 4.0,
-        "alpha": 1,
-        "beta": 32,
-        "attn_factor": 1.0,
-        "training_context_length": 128
+    "rope": {
+        "head_dim": 64,
+        "base": 10000,
+        "scaling": {
+            "type": "yarn",
+            "scaling_factor": 4.0,
+            "alpha": 1,
+            "beta": 32,
+            "attn_factor": 1.0,
+            "training_context_length": 128
+        }
     },
     "v_head_dim": 64,
     "num_shared_experts": 2,
