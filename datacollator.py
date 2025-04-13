@@ -2,7 +2,7 @@ import jinja2
 
 from dataclasses import dataclass
 import torch
-from tokenizer import Tokenizer
+from bpe_tokenizer import Tokenizer
 
 # Reference: https://github.com/huggingface/trl/blob/main/trl/models/utils.py#L44.
 @dataclass
@@ -146,48 +146,3 @@ class DataCollatorForChatMl:
                     i += 1
             label[start_ind:] = self.ignore_index
         return labels
-    
-if __name__ == "__main__":
-    tokenizer = Tokenizer('cl100k_base')
-    tokenizer.add_special_tokens(
-        [ChatMlSpecialTokens().bos_token, ChatMlSpecialTokens().eos_token]
-    )
-    messages = [
-        [
-            {"role": "user", "content": "Hello, how are you?"},
-            {"role": "assistant", "content": "I'm fine, thank you!"},
-            {"role": "user", "content": "What is the capital of France?"},
-        ],
-        [
-            {"role": "user", "content": "what is up?"},
-            {"role": "assistant", "content": "not much, just chilling"},
-            {"role": "user", "content": "what is your name?"},
-        ],
-    ]
-
-    formatted_input = format_input_text(messages[0])
-    print(f"formatted_input: {formatted_input}")
-
-    token_ids = tokenizer.encode(formatted_input)
-    print(f"token_ids: {token_ids}")
-
-    token_strs = tokenizer.decode(token_ids)
-    print(f"token_strs: {token_strs}")
-
-    bos = ChatMlSpecialTokens().bos_token
-    bos_encoded = tokenizer.encode(bos)
-    print(f"bos_encoded: {bos_encoded}")
-
-    eos = ChatMlSpecialTokens().eos_token
-    eos_encoded = tokenizer.encode(eos)[0]
-    print(f"eos_encoded: {eos_encoded}")
-
-    data_collator = DataCollatorForChatMl(
-        tokenizer,
-        tokenizer.eos_token_id,
-        -100,
-        ChatMlSpecialTokens().assistant,
-        tokenizer.eos_token_id,
-    )
-    batch = data_collator.process(messages)
-    print(f"batch: {batch}")

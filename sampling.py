@@ -34,10 +34,3 @@ def sample_top_k(logits: torch.Tensor, temperature: float, k: int):
     probs = torch.softmax(masked_logits, dim=-1)
     # sample from the distribution
     return torch.multinomial(probs, num_samples=1)
-
-
-if __name__ == '__main__':
-    logits = torch.tensor([[1.0, 2.0, 3.0, 2.5], [1.0, 2.0, 3.0, 2.5]])
-    # print(sample_top_p(logits, 1.0, 0.8))
-    print(sample_top_k(logits, 0.1, 2))
-    

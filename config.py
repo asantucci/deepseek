@@ -23,11 +23,9 @@ class DeepSeekConfig:
     # MLA parameters
     q_lora_rank: int
     kv_lora_rank: int
-    rope_head_dim: int
     nope_head_dim: int
     v_head_dim: int
-    rope_base: int
-    rope_scaling: dict
+    rope: dict
 
     # MoE parameters
     num_shared_experts: int

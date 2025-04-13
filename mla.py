@@ -381,7 +381,7 @@ class MultiHeadLatentAttention(nn.Module):
         self.config = config
         self.layer_idx = layer_idx
         # transformation for Q
-        self.q_head_dim = config.rope_head_dim + config.nope_head_dim
+        self.q_head_dim = config.rope['head_dim'] + config.nope_head_dim
         self.q_lora_rank = config.q_lora_rank
         if config.q_lora_rank is not None:
             self.q_a_proj = nn.Linear(config.d_model, config.q_lora_rank, bias=False)
@@ -398,7 +398,7 @@ class MultiHeadLatentAttention(nn.Module):
 
         # tranformation for K and V
         self.kv_a_proj_with_mqa = nn.Linear(
-            config.d_model, config.kv_lora_rank + config.rope_head_dim, bias=False
+            config.d_model, config.kv_lora_rank + config.rope['head_dim'], bias=False
         )
         self.kv_a_layernorm = RMSNorm(config.kv_lora_rank)
         self.kv_b_proj = nn.Linear(
@@ -411,54 +411,55 @@ class MultiHeadLatentAttention(nn.Module):
         )
         self.attention_dropout_rate = config.dropout
         self.residual_dropout = nn.Dropout(config.dropout)
-
+        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.nheads = config.nheads
-        self.rope_head_dim = config.rope_head_dim
+        self.rope_head_dim = config.rope['head_dim']
         self.nope_head_dim = config.nope_head_dim
         self.max_position_embeddings = config.max_position_embeddings
-        self.rope_base = config.rope_base
+        self.rope_base = config.rope['base']
         self.kv_lora_rank = config.kv_lora_rank
         self.q_lora_rank = config.q_lora_rank
         self.v_head_dim = config.v_head_dim
+        self.rope = None
         self._init_rope()
 
     def _init_rope(self):
-        if self.config.rope_scaling is None:
+        if self.config.rope['scaling'] is None:
             self.rope = RotaryEmbedding(
                 self.rope_head_dim,
                 self.max_position_embeddings,
-                base=self.rope_base,
+                base=self.rope['base'],
             )
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            scaling_factor = self.config.rope_scaling["scaling_factor"]
+            scaling_type = self.config.rope['scaling']["type"]
+            scaling_factor = self.config.rope['scaling']["scaling_factor"]
             if scaling_type == "pi":
                 self.rope = PositinalInterpolationRotaryEmbedding(
-                    self.rope_head_dim,
+                    self.rope.head_dim,
                     self.max_position_embeddings,
-                    base=self.rope_base,
+                    base=self.rope['base'],
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "dynamic":
                 self.rope = DynamicNTKAwareScalingRotaryEmbedding(
-                    self.rope_head_dim,
+                    self.rope.head_dim,
                     self.max_position_embeddings,
-                    base=self.rope_base,
+                    base=self.rope['base'],
                     scaling_factor=scaling_factor,
                 )
             elif scaling_type == "yarn":
-                alpha = self.config.rope_scaling["alpha"]
-                beta = self.config.rope_scaling["beta"]
-                attn_factor = self.config.rope_scaling["attn_factor"]
+                alpha = self.config.rope['scaling']["alpha"]
+                beta = self.config.rope['scaling']["beta"]
+                attn_factor = self.config.rope['scaling']["attn_factor"]
                 self.rope = YarnRotaryEmbedding(
-                    self.rope_head_dim,
+                    self.config.rope['head_dim'],
                     self.max_position_embeddings,
-                    base=self.rope_base,
+                    base=self.config.rope['base'],
                     scaling_factor=scaling_factor,
                     alpha=alpha,
                     beta=beta,
                     attn_factor=attn_factor,
-                    training_context_length=self.config.rope_scaling[
+                    training_context_length=self.config.rope['scaling'][
                         "training_context_length"
                     ],
                 )
@@ -542,7 +543,7 @@ class MultiHeadLatentAttention(nn.Module):
         output = F.scaled_dot_product_attention(
             query_states,
             key_states,
-            value_states,
+            value_states.to(self.device),
             attn_mask=attn_mask,
             dropout_p=self.attention_dropout_rate,
         )
