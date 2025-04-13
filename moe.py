@@ -7,7 +7,29 @@ from config import DeepSeekConfig
 import json
 
 class Distributor(object):
+    """
+    Distributor handles the efficient routing and aggregation of token representations
+    across multiple experts in a Mixture-of-Experts (MoE) setup.
+
+    Given a sparse gate matrix (indicating which expert each token should be routed to),
+    it performs the following:
+      1. Groups token inputs so that each expert processes a contiguous chunk of data.
+      2. Collects expert outputs, weights them using the softmax gate scores.
+      3. Reconstructs the full sequence output by combining expert results using index_add.
+
+    Attributes:
+        topk (int): Number of experts each token is routed to.
+        _batch_indices (Tensor): Indices used to reorder tokens by expert.
+        _groups (List[int]): Number of tokens routed to each expert.
+        _weights (Tensor): Weights (softmax scores) to scale each expert's output.
+    """
     def __init__(self, gates: torch.tensor, topk: int):
+        """
+        Args:
+            gates (Tensor): [B*T, num_experts] softmax probabilities for each token.
+                            Only top-k entries are nonzero.
+            topk (int): Number of experts to route each token to.
+        """
         super().__init__()
         # gates is [B*T, num_experts]
         self.topk = topk
@@ -41,10 +63,28 @@ class Distributor(object):
         self._weights = gates.t().reshape(-1)[gates.t().reshape(-1) > 0].view(-1, 1)
 
     def prepare_inputs_for_experts(self, x: torch.tensor) -> list[torch.tensor]:
+        """
+        Reorders and groups the input tensor so each expert gets its relevant chunk.
+
+        Args:
+            x (Tensor): Input tensor of shape [B*T, d_model].
+
+        Returns:
+            List[Tensor]: One tensor per expert containing their routed tokens.
+        """
         expanded_x = x[self._batch_indices]
         return expanded_x.split(self._groups)
 
     def combine(self, expert_outputs: list[torch.tensor]) -> torch.tensor:
+        """
+        Combines expert outputs back into a full sequence.
+
+        Args:
+            expert_outputs (List[Tensor]): Output from each expert.
+
+        Returns:
+            Tensor: Combined result of shape [B*T, d_model].
+        """
         # [B*topk, d_model]
         combined_output = torch.cat(expert_outputs, dim=0)
         # apply the weights to the expert outputs
@@ -62,6 +102,12 @@ class Distributor(object):
 
 
 class FeedForward(nn.Module):
+    """
+    FeedForward block used as the base expert in MoE.
+    
+    Uses a DeepSeek-specific implementation where the output is:
+        down_proj( SiLU(gate_proj(x)) * up_proj(x) )
+    """
     def __init__(self, d_model: int, hidden_dimension: int):
         super().__init__()
         self.gate_proj = nn.Linear(d_model, hidden_dimension, bias=False)
@@ -80,6 +126,12 @@ class FeedForward(nn.Module):
 
 class AddAuxiliaryLoss(torch.autograd.Function):
     """
+    Custom autograd function to inject auxiliary loss into the computation graph
+    without modifying the forward output.
+
+    This is useful for regularization losses (like expert load balancing) that
+    are not explicitly used in computing forward values but need gradient flow.
+    
     Copied from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py#L500
     """
 
@@ -102,6 +154,58 @@ class AddAuxiliaryLoss(torch.autograd.Function):
 
 
 class MoE(nn.Module):
+    """
+    Mixture-of-Experts (MoE) layer as used in DeepSeek-V2.
+
+    This module routes each token to a small number of expert feedforward layers
+    using learned softmax gates. In addition to the routed experts, a shared expert
+    processes every token for added stability and convergence.
+
+    Features:
+      - Top-k sparse expert routing per token.
+      - Efficient batching and aggregation via Distributor.
+      - Load balancing auxiliary loss to encourage equal expert usage.
+      - Shared experts for fallback signal.
+
+    Graphical representation:
+        Input x (B, T, d)
+                 ↓
+     +--------------------------+
+     | Compute softmax gates W |
+     +--------------------------+
+                 ↓
+        ┌────────────────────┐
+        │  top-k experts per │
+        │      token         │
+        └────────────────────┘
+                 ↓
+        ┌───────────────────────────────┐
+        │ Distributor: group by expert │
+        └───────────────────────────────┘
+            /           |           \
+     Expert 0     Expert 1     Expert N
+      FFN(x)        FFN(x)        FFN(x)
+            \           |           /
+        ┌───────────────────────────────┐
+        │ Distributor: combine outputs │
+        └───────────────────────────────┘
+                 ↓
+        +--------------------------+
+        | SharedExpert FFN(x)     |
+        +--------------------------+
+                 ↓
+        +--------------------------+
+        | Add auxiliary loss       |
+        +--------------------------+
+                 ↓
+           Output (B, T, d)
+
+    Inputs:
+        x: Tensor of shape [B, T, d_model]
+
+    Outputs:
+        Tensor of shape [B, T, d_model]
+    """
     def __init__(self, config: DeepSeekConfig):
         super().__init__()
 
@@ -140,7 +244,13 @@ class MoE(nn.Module):
 
     def forward(self, x: torch.tensor) -> torch.tensor:
         """
-        x: tensor of shape [B, T, d_model]
+        Forward pass for MoE block.
+
+        Args:
+            x (Tensor): Input of shape [B, T, d_model]
+
+        Returns:
+            Tensor: Output of shape [B, T, d_model]
         """
         return self._forward_optimized(x)
 
