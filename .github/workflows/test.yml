@@ -22,7 +22,6 @@ jobs:
     - name: Install dependencies
       run: |
         pip install uv
-        uv run python -m pip install --upgrade pip
         uv run pip install pytest pytest-cov
         uv run pip install -r requirements.txt || true  # optional: if using requirements.txt
         uv run pip install . || true                    # optional: if using editable install
