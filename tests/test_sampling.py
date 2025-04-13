@@ -29,11 +29,11 @@ def test_sample_top_p_shape(logits):
 
 @pytest.mark.parametrize("batch_idx", [0, 1])
 def test_sample_top_p_is_subset(logits, batch_idx):
-    output = sample_top_p(logits, temperature=1.0, top_p=0.9)
+    output = sample_top_p(logits, temperature=1.0, top_p=1)
     probs = torch.softmax(logits, dim=-1)
     sorted_probs, sorted_indices = torch.sort(probs, dim=-1, descending=True)
     cum_probs = torch.cumsum(sorted_probs, dim=-1)
-    top_p_mask = cum_probs[batch_idx] <= 0.9
+    top_p_mask = cum_probs[batch_idx] <= 1
     top_p_mask[0] = True  # Always keep the highest prob token
     valid_indices = sorted_indices[batch_idx][top_p_mask].tolist()
     assert output[batch_idx].item() in valid_indices

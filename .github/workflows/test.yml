@@ -8,7 +8,9 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    if: contains(github.event.pull_request.labels.*.name, 'CUDA CI')
+    runs-on:
+      group: cuda-gpu-runner-group
 
     steps:
     - name: Checkout code
