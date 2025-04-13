@@ -1,0 +1,31 @@
+name: Run Pytest on Push and PR
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install dependencies
+      run: |
+        uv run python -m pip install --upgrade pip
+        uv run pip install pytest pytest-cov
+        uv run pip install -r requirements.txt || true  # optional: if using requirements.txt
+        uv run pip install . || true                    # optional: if using editable install
+
+    - name: Run tests with coverage
+      run: |
+        uv run pytest --cov=. --cov-report=term-missing
