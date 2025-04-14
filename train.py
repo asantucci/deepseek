@@ -1,3 +1,4 @@
+import datetime
 import os
 import argparse
 import torch
@@ -13,6 +14,7 @@ from contextlib import nullcontext
 import bitsandbytes as bnb
 from enum import Enum
 from dataloader import TinyShakespeareDataLoader, FineWebEduDataLoader, DataLoader
+import mla
 import wandb
 
 
@@ -133,6 +135,8 @@ def forward_and_backward(model, x, y, optimizer, ctx: torch.autocast = nullconte
 def train(args):
     global ptdtype
     ptdtype = ptdtype[args.dtype]
+    initial_time = datetime.datetime.now()
+    file_identifier = initial_time.strftime("%Y_%m_%d_%H_%M_%S")
     ctx = (
         nullcontext()
         if args.device == "cpu"
@@ -159,7 +163,7 @@ def train(args):
     best_val_loss = 1e9
     iter_num = 0
     if args.resume:
-        checkpoint = torch.load(os.path.join(os.path.expanduser(args.out_dir), "ckpt.pt"))
+        checkpoint = torch.load(args.resume)
         config = checkpoint["model_config"]
         model = DeepSeekModelForCausalLM(config)
         model.to(args.device)
@@ -182,10 +186,11 @@ def train(args):
         )
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
+        past_key_val = None
         for _ in range(args.gradient_accumulation_steps):
             x, y = train_loader.next_batch()
             with ctx:
-                _, train_loss, _ = model(x, y)
+                _, train_loss, past_key_val = model(x, y, past_key_value=past_key_val)
             train_loss = train_loss / args.gradient_accumulation_steps
             train_loss.backward()
         if args.grad_clip > 0:
@@ -218,7 +223,7 @@ def train(args):
                         "best_val_loss": best_val_loss,
                         "training_args": args,
                     }
-                    checkpoint_path = os.path.join(os.path.expanduser(args.out_dir), args.checkpoint_path)
+                    checkpoint_path = os.path.join(os.path.expanduser(args.out_dir), args.checkpoint_path + file_identifier + '.pt')
                     os.makedirs(os.path.expanduser(args.out_dir), mode=0o777, exist_ok=True)
                     torch.save(checkpoint, checkpoint_path)
             print(
@@ -306,11 +311,11 @@ if __name__ == "__main__":
     args.add_argument("--decay-lr", type=bool, default=True)
 
     args.add_argument("--out-dir", type=str, default="./data/sft")
-    args.add_argument("--resume", type=bool, default=False)
+    args.add_argument("--resume", type=str, default='')
     args.add_argument(
         "--checkpoint-path",
         type=str,
-        default="8_bit_optimizer_ckpt.pt",
+        default="8_bit_optimizer_ckpt",
     )
 
     # adamw arguments

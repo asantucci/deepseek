@@ -372,7 +372,7 @@ def get_attention_mask(attn_mask: torch.tensor):
     # Convert to boolean
     mask_matrix = mask_matrix.bool().unsqueeze(1)
 
-    return mask_matrix
+    return causal_mask.bool().unsqueeze(0).unsqueeze(1)
 
 
 class MultiHeadLatentAttention(nn.Module):
@@ -543,7 +543,7 @@ class MultiHeadLatentAttention(nn.Module):
         output = F.scaled_dot_product_attention(
             query_states,
             key_states,
-            value_states.to(self.device),
+            value_states,
             attn_mask=attn_mask,
             dropout_p=self.attention_dropout_rate,
         )

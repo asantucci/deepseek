@@ -5,7 +5,7 @@
     "dropout": 0.4,
     "device": "cuda",
     "use_kv_cache": true,
-    "q_lora_rank": null,
+    "q_lora_rank": 128,
     "kv_lora_rank": 512,
     "nope_head_dim": 128,
     "rope": {

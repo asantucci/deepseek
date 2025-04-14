@@ -7,6 +7,7 @@ from datacollator import ChatMlSpecialTokens, format_input_text
 import json
 import os
 import sys
+import traceback
 
 def load_model(checkpoint_path: str, device: str):
     with open("config.json", "r") as f:
@@ -15,7 +16,7 @@ def load_model(checkpoint_path: str, device: str):
     model = DeepSeekModelForCausalLM(config).to(device)
 
     if checkpoint_path is not None and os.path.exists(checkpoint_path):
-        ckpt = torch.load(checkpoint_path, map_location=device)
+        ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
         model.load_state_dict(ckpt["model"])
         print(f"✅ Loaded model from {checkpoint_path}")
 
@@ -32,7 +33,7 @@ def stream_generate(model, tokenizer, prompt: str, max_new_tokens=100, temperatu
         add_generation_prompt=True
     )
     input_ids = tokenizer.encode(prompt_formatted)
-    input_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0).to('cuda')
+    input_tensor = torch.tensor(input_ids, dtype=torch.long).unsqueeze(0)
 
     kv_cache = None
     generated = input_tensor
@@ -56,7 +57,7 @@ def main():
     parser.add_argument("--max-new-tokens", type=int, default=100)
     parser.add_argument("--temperature", type=float, default=0.8)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--checkpoint-path", type=str, default="~/data/sft/8_bit_optimizer_ckpt.pt")
+    parser.add_argument("--checkpoint-path", type=str, default="~/data/deepseek_sft/8_bit_optimizer_ckpt.pt")
     args = parser.parse_args()
 
     tokenizer = Tokenizer("cl100k_base")
@@ -85,6 +86,7 @@ def main():
             break
         except Exception as e:
             print(f"\n⚠️ Error: {e}")
+            traceback.print_exc()
             continue
 
 if __name__ == "__main__":
